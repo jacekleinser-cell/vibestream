@@ -1,0 +1,5 @@
+{
+  "name": "VibeStream Music Player",
+  "description": "A premium music player that allows searching and queuing YouTube videos.",
+  "requestFramePermissions": []
+}
