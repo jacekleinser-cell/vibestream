@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, ChangeEvent } from 'react';
 import { 
   Shuffle, Sun, Moon, X, Search, Play, Pause, SkipBack, SkipForward, 
   Menu, Heart, Plus, Music, ListMusic, Home, Library, MoreVertical,
-  Volume2, VolumeX, Repeat, LayoutGrid, List
+  Volume2, VolumeX, Repeat, LayoutGrid, List, RefreshCw, AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -129,10 +129,27 @@ export default function App() {
   const [selectedSpotifyPlaylist, setSelectedSpotifyPlaylist] = useState<any | null>(null);
   const [spotifyTracks, setSpotifyTracks] = useState<any[]>([]);
   const [isSpotifyAuthenticated, setIsSpotifyAuthenticated] = useState(false);
+  const [isSpotifyPlaylistsLoading, setIsSpotifyPlaylistsLoading] = useState(false);
+  const [isSpotifyTracksLoading, setIsSpotifyTracksLoading] = useState(false);
   const [isTransferring, setIsTransferring] = useState(false);
   const [importProgress, setImportProgress] = useState({ current: 0, total: 0 });
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [manualSpotifyUrl, setManualSpotifyUrl] = useState('');
+  const [manualYoutubeUrl, setManualYoutubeUrl] = useState('');
+  const [textImportValue, setTextImportValue] = useState('');
+  const [isTextImportOpen, setIsTextImportOpen] = useState(true);
+  const [importPreviewSongs, setImportPreviewSongs] = useState<{ originalQuery: string, song: Song | null }[]>([]);
+  const [isImportPreviewMode, setIsImportPreviewMode] = useState(false);
+  const [importPlaylistName, setImportPlaylistName] = useState('');
+  const [replacingIndex, setReplacingIndex] = useState<number | null>(null);
+  const [replaceSearchQuery, setReplaceSearchQuery] = useState('');
+  const [replaceSearchResults, setReplaceSearchResults] = useState<Song[]>([]);
+  const [isReplaceSearching, setIsReplaceSearching] = useState(false);
+  const [toast, setToast] = useState<{ message: string, type: 'success' | 'error' | 'info' } | null>(null);
+  const [recentlyPlayed, setRecentlyPlayed] = useState<Song[]>(JSON.parse(localStorage.getItem('recentlyPlayed') || '[]'));
+  const [playStats, setPlayStats] = useState<Record<string, { count: number, lastPlayed: number }>>(JSON.parse(localStorage.getItem('playStats') || '{}'));
+  const [recommendations, setRecommendations] = useState<Song[]>([]);
 
   const playerRef = useRef<any>(null);
   const progressInterval = useRef<any>(null);
@@ -192,6 +209,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('userPlaylists', JSON.stringify(playlists));
   }, [playlists]);
+
+  const showToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 3000);
+  };
 
   // --- Initialization ---
   const initPlayer = useCallback(() => {
@@ -289,6 +311,17 @@ export default function App() {
   }, [initPlayer]);
 
   useEffect(() => {
+    const checkAuth = async () => {
+      try {
+        const data = await safeFetch('/api/spotify/playlists');
+        setIsSpotifyAuthenticated(true);
+        setSpotifyPlaylists(data.items || []);
+      } catch (e) {
+        // Not authenticated or error, ignore silently for initial check
+      }
+    };
+    checkAuth();
+
     const handleMessage = (event: MessageEvent) => {
       if (event.data?.type === 'SPOTIFY_AUTH_SUCCESS') {
         setIsSpotifyAuthenticated(true);
@@ -346,39 +379,124 @@ export default function App() {
   }, [playlist, likedSongs, favoriteArtists, playlists]);
 
   // --- Actions ---
+  const safeFetch = async (url: string, options?: RequestInit) => {
+    const response = await fetch(url, options);
+    const contentType = response.headers.get("content-type");
+    
+    if (contentType && contentType.includes("text/html")) {
+      const text = await response.text();
+      console.error("HTML response received instead of JSON:", text.substring(0, 200));
+      
+      if (text.includes("Active preview") || text.includes("Loading")) {
+        throw new Error("The server is still starting up. Please wait 10-15 seconds and try again.");
+      } else if (text.includes("404") || text.includes("Not Found")) {
+        throw new Error("The API endpoint was not found. Please refresh the page.");
+      } else if (response.status === 403) {
+        throw new Error("Access Forbidden (403). This often means Spotify API keys are invalid or your Spotify Developer account lacks the required Premium subscription.");
+      } else {
+        throw new Error(`Unexpected server response (${response.status} HTML). The server might be restarting or misconfigured.`);
+      }
+    }
+    
+    const data = await response.json();
+    if (!response.ok) {
+      const message = data.error?.message || data.error || `Request failed with status ${response.status}`;
+      if (message.includes("premium subscription")) {
+        throw new Error("Spotify Premium Required: The owner of the Spotify Developer App must have an active Premium subscription to use this feature.");
+      }
+      throw new Error(message);
+    }
+    return data;
+  };
+
+  const [serverRedirectUri, setServerRedirectUri] = useState<string>("");
+  const [isSpotifyConfigured, setIsSpotifyConfigured] = useState<boolean>(true);
+
+  useEffect(() => {
+    safeFetch("/api/config")
+      .then(data => {
+        if (data.redirectUri) setServerRedirectUri(data.redirectUri);
+        const configured = data.spotifyClientId === "Set" && data.spotifyClientSecret === "Set";
+        setIsSpotifyConfigured(configured);
+        if (!configured) {
+          console.warn("Spotify API keys are missing. Please add them to the Secrets panel.");
+        }
+      })
+      .catch(err => console.error("Failed to fetch config:", err));
+  }, []);
+
   const handleSpotifyConnect = async () => {
     try {
-      const response = await fetch('/api/auth/spotify');
-      const { url } = await response.json();
-      window.open(url, 'spotify_auth', 'width=600,height=800');
-    } catch (err) {
+      const data = await safeFetch('/api/auth/spotify');
+      window.open(data.url, 'spotify_auth', 'width=600,height=800');
+    } catch (err: any) {
       console.error("Spotify connect error:", err);
+      showToast(err.message, 'error');
     }
   };
 
   const fetchSpotifyPlaylists = async () => {
+    setIsSpotifyPlaylistsLoading(true);
     try {
-      const response = await fetch('/api/spotify/playlists');
-      if (response.status === 401) {
-        setIsSpotifyAuthenticated(false);
-        return;
-      }
-      const data = await response.json();
+      const data = await safeFetch('/api/spotify/playlists');
       setSpotifyPlaylists(data.items || []);
       setIsSpotifyAuthenticated(true);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Fetch Spotify playlists error:", err);
+      if (err.message.includes("premium subscription")) {
+        showToast("Spotify Premium required for automatic sync. Try manual import below!", 'error');
+      } else if (err.message.includes("401")) {
+        setIsSpotifyAuthenticated(false);
+        showToast("Spotify session expired. Please reconnect.", 'info');
+      } else {
+        showToast(err.message, 'error');
+      }
+    } finally {
+      setIsSpotifyPlaylistsLoading(false);
     }
   };
 
   const viewSpotifyPlaylist = async (pl: any) => {
     setSelectedSpotifyPlaylist(pl);
+    setIsSpotifyTracksLoading(true);
     try {
-      const response = await fetch(`/api/spotify/playlists/${pl.id}/tracks`);
-      const data = await response.json();
+      const data = await safeFetch(`/api/spotify/playlists/${pl.id}/tracks`);
       setSpotifyTracks(data.items || []);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Fetch Spotify tracks error:", err);
+      showToast(err.message, 'error');
+    } finally {
+      setIsSpotifyTracksLoading(false);
+    }
+  };
+
+  const importManualPlaylist = async () => {
+    if (!manualSpotifyUrl) return;
+    
+    const match = manualSpotifyUrl.match(/playlist\/([a-zA-Z0-9]+)/);
+    if (!match) {
+      showToast("Invalid Spotify Playlist URL", 'error');
+      return;
+    }
+    
+    const playlistId = match[1];
+    setIsSpotifyPlaylistsLoading(true);
+    
+    try {
+      const data = await safeFetch(`/api/spotify/playlists/${playlistId}`);
+      
+      setSpotifyPlaylists(prev => {
+        if (prev.some(p => p.id === data.id)) return prev;
+        return [data, ...prev];
+      });
+      
+      viewSpotifyPlaylist(data);
+      setManualSpotifyUrl('');
+      showToast("Playlist found!", 'success');
+    } catch (err: any) {
+      showToast(err.message, 'error');
+    } finally {
+      setIsSpotifyPlaylistsLoading(false);
     }
   };
 
@@ -386,14 +504,17 @@ export default function App() {
     setIsTransferring(true);
     try {
       const query = `${track.name} ${track.artists[0].name}`;
-      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const data = await response.json();
+      const data = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
       const firstVideo = data.items.find((i: any) => i.type === 'video');
       if (firstVideo) {
         playSong(firstVideo);
+        showToast(`Playing: ${track.name}`, 'success');
+      } else {
+        showToast(`Could not find "${track.name}" on YouTube`, 'error');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Import Spotify track error:", err);
+      showToast(`Failed to import track: ${err.message}`, 'error');
     } finally {
       setIsTransferring(false);
     }
@@ -404,39 +525,239 @@ export default function App() {
     setImportProgress({ current: 0, total: pl.tracks.total });
     
     try {
-      const response = await fetch(`/api/spotify/playlists/${pl.id}/tracks`);
-      const data = await response.json();
-      const tracks = data.items || [];
+      let allTracks: any[] = [];
+      let offset = 0;
+      const limit = 100;
+      let hasMore = true;
       
+      while (hasMore) {
+        const data = await safeFetch(`/api/spotify/playlists/${pl.id}/tracks?offset=${offset}&limit=${limit}`);
+        const pageTracks = data.items || [];
+        allTracks = [...allTracks, ...pageTracks];
+        
+        if (data.next && allTracks.length < 1000) { // Safety cap at 1000 songs
+          offset += limit;
+        } else {
+          hasMore = false;
+        }
+      }
+      
+      const tracks = allTracks;
       const importedSongs: Song[] = [];
       
       for (let i = 0; i < tracks.length; i++) {
         const track = tracks[i].track;
+        if (!track) continue;
+        
         setImportProgress({ current: i + 1, total: tracks.length });
         
         const query = `${track.name} ${track.artists[0].name}`;
-        const searchRes = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-        const searchData = await searchRes.json();
-        const firstVideo = searchData.items.find((item: any) => item.type === 'video');
-        
-        if (firstVideo) {
-          importedSongs.push(firstVideo);
+        try {
+          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
+          const firstVideo = searchData.items.find((item: any) => item.type === 'video');
+          
+          if (firstVideo) {
+            importedSongs.push(firstVideo);
+          }
+          
+          // Small delay to prevent rate limiting
+          await new Promise(resolve => setTimeout(resolve, 300));
+        } catch (e) {
+          console.error(`Error importing track ${track.name}:`, e);
         }
       }
 
       if (importedSongs.length > 0) {
         const newPlName = `Spotify: ${pl.name}`;
         setPlaylists(prev => [...prev, { name: newPlName, songs: importedSongs }]);
-        alert(`Successfully imported ${importedSongs.length} songs to playlist "${newPlName}"`);
+        showToast(`Successfully imported ${importedSongs.length} songs to playlist "${newPlName}"`, 'success');
+      } else {
+        showToast("No songs were found on YouTube to import", 'error');
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Bulk import error:", err);
-      alert("Failed to import playlist. Check console for details.");
+      showToast(`Failed to import playlist: ${err.message}`, 'error');
     } finally {
       setIsTransferring(false);
       setImportProgress({ current: 0, total: 0 });
     }
   };
+
+  const importYoutubePlaylist = async () => {
+    if (!manualYoutubeUrl.trim()) return;
+    
+    try {
+      let playlistId = '';
+      try {
+        const url = new URL(manualYoutubeUrl);
+        playlistId = url.searchParams.get('list') || '';
+      } catch (e) {
+        // Not a URL, maybe it's just the ID
+        playlistId = manualYoutubeUrl;
+      }
+      
+      if (!playlistId) {
+        showToast("Invalid YouTube Playlist. Please provide a full URL or a Playlist ID.", 'error');
+        return;
+      }
+
+      setIsTransferring(true);
+      const data = await safeFetch(`/api/playlist/${playlistId}`);
+      const songs = data.items || [];
+      
+      if (songs.length > 0) {
+        const newPlName = `YT Import: ${playlistId.substring(0, 8)}...`;
+        setPlaylists(prev => [...prev, { name: newPlName, songs }]);
+        showToast(`Successfully imported ${songs.length} songs from YouTube playlist`, 'success');
+        setManualYoutubeUrl('');
+      } else {
+        showToast("No songs found in this YouTube playlist", 'error');
+      }
+    } catch (err: any) {
+      console.error("YouTube playlist import error:", err);
+      showToast(`Failed to import YouTube playlist: ${err.message}`, 'error');
+    } finally {
+      setIsTransferring(false);
+    }
+  };
+
+  const startTextImportPreview = async () => {
+    if (!textImportValue.trim()) return;
+    
+    let lines = textImportValue.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length > 0 && (lines[0].toLowerCase().includes('track') || lines[0].toLowerCase().includes('artist'))) {
+      lines = lines.slice(1);
+    }
+    if (lines.length === 0) return;
+
+    setIsTransferring(true);
+    setImportProgress({ current: 0, total: lines.length });
+    const previewItems: { originalQuery: string, song: Song | null }[] = [];
+    
+    try {
+      for (let i = 0; i < lines.length; i++) {
+        let query = lines[i];
+        if (query.includes(',')) {
+          query = query.replace(/"/g, '').replace(/,/g, ' ');
+        }
+        setImportProgress({ current: i + 1, total: lines.length });
+        
+        try {
+          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
+          const firstVideo = searchData.items.find((item: any) => item.type === 'video');
+          previewItems.push({ originalQuery: lines[i], song: firstVideo || null });
+          await new Promise(resolve => setTimeout(resolve, 200));
+        } catch (e) {
+          previewItems.push({ originalQuery: lines[i], song: null });
+        }
+      }
+      setImportPreviewSongs(previewItems);
+      setIsImportPreviewMode(true);
+      setImportPlaylistName(`My Import ${new Date().toLocaleDateString()}`);
+    } catch (err: any) {
+      showToast(`Failed to process list: ${err.message}`, 'error');
+    } finally {
+      setIsTransferring(false);
+      setImportProgress({ current: 0, total: 0 });
+    }
+  };
+
+  const finalizeImport = () => {
+    const songsToImport = importPreviewSongs.map(item => item.song).filter((s): s is Song => s !== null);
+    if (songsToImport.length === 0) {
+      showToast("No valid songs to import", 'error');
+      return;
+    }
+    const name = importPlaylistName.trim() || `Imported Playlist ${new Date().toLocaleDateString()}`;
+    setPlaylists(prev => [...prev, { name, songs: songsToImport }]);
+    showToast(`Successfully created playlist "${name}" with ${songsToImport.length} songs`, 'success');
+    setIsImportPreviewMode(false);
+    setImportPreviewSongs([]);
+    setTextImportValue('');
+    setViewingSection('home');
+  };
+
+  const handleReplaceSearch = async (e: any) => {
+    e.preventDefault();
+    if (!replaceSearchQuery.trim()) return;
+    
+    setIsReplaceSearching(true);
+    try {
+      const data = await safeFetch(`/api/search?q=${encodeURIComponent(replaceSearchQuery)}`);
+      setReplaceSearchResults(data.items.filter((i: any) => i.type === 'video'));
+    } catch (err) {
+      showToast("Search failed", 'error');
+    } finally {
+      setIsReplaceSearching(false);
+    }
+  };
+
+  const selectReplacement = (song: Song) => {
+    if (replacingIndex === null) return;
+    setImportPreviewSongs(prev => {
+      const next = [...prev];
+      next[replacingIndex] = { ...next[replacingIndex], song };
+      return next;
+    });
+    setReplacingIndex(null);
+    setReplaceSearchQuery('');
+    setReplaceSearchResults([]);
+    showToast("Song updated!", 'success');
+  };
+
+  const deletePlaylist = (name: string) => {
+    setPlaylists(prev => {
+      const next = prev.filter(p => p.name !== name);
+      localStorage.setItem('userPlaylists', JSON.stringify(next));
+      return next;
+    });
+    setViewingSection('home');
+    showToast(`Playlist "${name}" deleted`, 'info');
+  };
+
+  const removeFavoriteArtist = (name: string) => {
+    setFavoriteArtists(prev => {
+      const next = prev.filter(a => a !== name);
+      localStorage.setItem('favoriteArtists', JSON.stringify(next));
+      return next;
+    });
+    setViewingSection('home');
+    showToast(`Artist "${name}" removed from favorites`, 'info');
+  };
+
+  const generateRecommendations = useCallback(async () => {
+    if (recentlyPlayed.length === 0 && likedSongs.length === 0) {
+      setRecommendations(discoverySongs.slice(0, 6));
+      return;
+    }
+
+    // Get top artists from playStats
+    const topArtists = Object.entries(playStats)
+      .sort((a, b) => (b[1] as any).count - (a[1] as any).count)
+      .slice(0, 3)
+      .map(([name]) => name);
+
+    // Get some liked artists
+    const likedArtists = Array.from(new Set(likedSongs.map(s => s.uploaderName))).slice(0, 3);
+    
+    const seedArtists = Array.from(new Set([...topArtists, ...likedArtists, ...favoriteArtists])).slice(0, 5);
+    
+    if (seedArtists.length > 0) {
+      const randomArtist = seedArtists[Math.floor(Math.random() * seedArtists.length)];
+      try {
+        const data = await safeFetch(`/api/artist/${encodeURIComponent(randomArtist)}`);
+        if (data.items && data.items.length > 0) {
+          setRecommendations(data.items.slice(0, 6));
+        }
+      } catch (err) {
+        console.error("Recommendation fetch error:", err);
+      }
+    }
+  }, [recentlyPlayed, likedSongs, playStats, favoriteArtists, discoverySongs]);
+
+  useEffect(() => {
+    generateRecommendations();
+  }, [generateRecommendations]);
 
   const resetPlayer = () => {
     setPlayerStatus('Resetting...');
@@ -462,10 +783,9 @@ export default function App() {
     setIsDiscoveryLoading(true);
     try {
       const query = category === 'Trending' ? 'trending music 2024' : `${category} hits 2024`;
-      const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-      const data = await response.json();
+      const data = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
       setDiscoverySongs(data.items.filter((i: any) => i.type === 'video').slice(0, 12));
-    } catch (err) {
+    } catch (err: any) {
       console.error("Discovery fetch error:", err);
     } finally {
       setIsDiscoveryLoading(false);
@@ -481,6 +801,9 @@ export default function App() {
           ? { ...pl, songs: pl.songs.filter(s => s.id !== song.id) } 
           : pl
       ));
+      if (selectedPlaylist?.name === playlistName) {
+        setSelectedPlaylist(prev => prev ? { ...prev, songs: prev.songs.filter(s => s.id !== song.id) } : null);
+      }
     }
   };
 
@@ -491,9 +814,7 @@ export default function App() {
     setSelectedArtist(null);
     setSelectedPlaylist(null);
     try {
-      const response = await fetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
-      if (!response.ok) throw new Error('Network response was not ok');
-      const data = await response.json();
+      const data = await safeFetch(`/api/search?q=${encodeURIComponent(searchQuery)}`);
       const items = data.items || [];
       setSearchResults({
         songs: items.filter((i: any) => i.type === 'video'),
@@ -501,8 +822,9 @@ export default function App() {
         playlists: items.filter((i: any) => i.type === 'playlist'),
         albums: []
       });
-    } catch (err) {
+    } catch (err: any) {
       console.error("Search error:", err);
+      showToast(`Search failed: ${err.message}`, 'error');
       setSearchResults({ songs: [], artists: [], playlists: [], albums: [] });
     }
   };
@@ -513,11 +835,11 @@ export default function App() {
     setSelectedPlaylist(null);
     setIsSearchOpen(false);
     try {
-      const response = await fetch(`/api/artist/${encodeURIComponent(artistName)}`);
-      const data = await response.json();
+      const data = await safeFetch(`/api/artist/${encodeURIComponent(artistName)}`);
       setArtistSongs(data.items || []);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Artist search error:", err);
+      showToast(`Failed to load artist: ${err.message}`, 'error');
       setArtistSongs([]);
     }
   };
@@ -529,6 +851,19 @@ export default function App() {
     setIsSearchOpen(false);
   };
 
+  const handleSpotifyLogout = async () => {
+    try {
+      await safeFetch('/api/auth/spotify/logout');
+      setIsSpotifyAuthenticated(false);
+      setSpotifyPlaylists([]);
+      setSpotifyTracks([]);
+      setSelectedSpotifyPlaylist(null);
+      showToast("Spotify session cleared", 'info');
+    } catch (err: any) {
+      console.error("Logout error:", err);
+      showToast("Failed to logout from Spotify", 'error');
+    }
+  };
   const createPlaylist = () => {
     if (newPlaylistName) {
       setPlaylists(prev => [...prev, { name: newPlaylistName, songs: [] }]);
@@ -547,7 +882,31 @@ export default function App() {
     setSongToAddToPlaylist(null);
   };
 
+  const trackPlay = (song: Song) => {
+    // Update recently played
+    setRecentlyPlayed(prev => {
+      const filtered = prev.filter(s => s.id !== song.id);
+      const next = [song, ...filtered].slice(0, 50);
+      localStorage.setItem('recentlyPlayed', JSON.stringify(next));
+      return next;
+    });
+
+    // Update play stats
+    setPlayStats(prev => {
+      const next = { ...prev };
+      const artist = song.uploaderName || 'Unknown';
+      if (!next[artist]) {
+        next[artist] = { count: 0, lastPlayed: 0 };
+      }
+      next[artist].count += 1;
+      next[artist].lastPlayed = Date.now();
+      localStorage.setItem('playStats', JSON.stringify(next));
+      return next;
+    });
+  };
+
   const playSong = (song: Song, fromQueue: boolean = false) => {
+    trackPlay(song);
     let newIndex = currentIndex;
     if (!fromQueue) {
       const newPlaylist = [...playlist];
@@ -758,6 +1117,27 @@ export default function App() {
 
   return (
     <div className="flex h-screen bg-bg-main text-white overflow-hidden">
+      {/* Toast Notification */}
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            initial={{ opacity: 0, y: 50, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: 50, x: '-50%' }}
+            className={`fixed bottom-28 left-1/2 z-[100] px-6 py-3 rounded-full shadow-2xl flex items-center gap-3 border ${
+              toast.type === 'success' ? 'bg-green-600 border-green-500' : 
+              toast.type === 'error' ? 'bg-red-600 border-red-500' : 
+              'bg-indigo-600 border-indigo-500'
+            }`}
+          >
+            <p className="text-sm font-bold">{toast.message}</p>
+            <button onClick={() => setToast(null)} className="text-white/60 hover:text-white">
+              <X size={14} />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
       <aside className={`flex flex-col bg-bg-sidebar border-r border-border transition-all duration-300 ${isSidebarOpen ? 'w-64' : 'w-0 overflow-hidden'}`}>
         <div className="p-6">
@@ -837,7 +1217,7 @@ export default function App() {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && searchMusic()}
-                placeholder="Search for lectures, tutorials, or study media..."
+                placeholder="Search for songs, artists, or playlists..."
                 className="w-full bg-white/5 border border-white/10 rounded-full py-2 pl-10 pr-4 text-sm focus:outline-none focus:border-white/30 transition-all"
               />
             </div>
@@ -971,6 +1351,13 @@ export default function App() {
                       >
                         <Heart size={20} className={favoriteArtists.includes(selectedArtist || '') ? 'fill-white' : ''} />
                       </button>
+                      <button 
+                        onClick={() => selectedArtist && removeFavoriteArtist(selectedArtist)}
+                        className="p-3 rounded-full border border-white/20 hover:border-red-500 hover:text-red-500 transition-colors"
+                        title="Remove from favorites"
+                      >
+                        <X size={20} />
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -1025,6 +1412,13 @@ export default function App() {
                       >
                         Add more songs
                       </button>
+                      <button 
+                        onClick={() => selectedPlaylist && deletePlaylist(selectedPlaylist.name)}
+                        className="ml-auto p-3 rounded-full border border-white/20 hover:border-red-500 hover:text-red-500 transition-colors"
+                        title="Delete playlist"
+                      >
+                        <X size={20} />
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -1062,111 +1456,142 @@ export default function App() {
                 key="transfer"
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="space-y-8"
+                className="space-y-8 max-w-4xl mx-auto"
               >
-                <div className="flex items-end gap-6">
-                  <div className="w-48 h-48 bg-[#1DB954] rounded-lg shadow-2xl flex items-center justify-center">
-                    <Music size={64} className="text-white" />
+                <div className="flex items-center gap-6">
+                  <div className="w-24 h-24 bg-gradient-to-br from-[#1DB954] to-[#191414] rounded-2xl shadow-2xl flex items-center justify-center">
+                    <RefreshCw size={40} className={`text-white ${isTransferring ? 'animate-spin' : ''}`} />
                   </div>
                   <div>
-                    <h4 className="text-xs font-bold uppercase tracking-widest mb-2">Import</h4>
-                    <h1 className="text-6xl font-black mb-4">Spotify Transfer</h1>
-                    <p className="text-white/60 text-sm">Connect your Spotify account to import your playlists and tracks.</p>
+                    <h4 className="text-xs font-bold uppercase tracking-widest mb-1 text-white/40">Magic Importer</h4>
+                    <h1 className="text-4xl font-black mb-2">Transfer Your Music</h1>
+                    <p className="text-white/60 text-sm">Paste a list of songs from Spotify, Apple Music, or anywhere else.</p>
                   </div>
                 </div>
 
-                {!isSpotifyAuthenticated ? (
-                  <div className="py-20 text-center space-y-8 max-w-2xl mx-auto">
-                    <div className="space-y-4">
-                      <p className="text-xl font-medium">Connect to Spotify to get started</p>
-                      <p className="text-white/40 text-sm leading-relaxed">
-                        Because StudyStream is your own private instance, you'll need to provide your own Spotify API credentials. 
-                        This ensures your data stays private and your app has its own dedicated connection.
-                      </p>
-                    </div>
-                    <button 
-                      onClick={handleSpotifyConnect}
-                      className="bg-[#1DB954] text-white px-10 py-4 rounded-full font-bold text-lg hover:scale-105 transition-transform shadow-xl"
-                    >
-                      Connect Spotify
-                    </button>
-                    <div className="pt-8 border-t border-white/5 text-left">
-                      <h5 className="text-xs font-bold uppercase tracking-widest mb-4 text-white/60">How to get your credentials:</h5>
-                      <ol className="text-xs text-white/40 space-y-2 list-decimal pl-4">
-                        <li>Go to the <a href="https://developer.spotify.com/dashboard" target="_blank" className="text-[#1DB954] hover:underline">Spotify Developer Dashboard</a>.</li>
-                        <li>Create a new App and name it "StudyStream".</li>
-                        <li>In Settings, add this Redirect URI: <code className="bg-white/5 px-1 rounded text-white/80">{window.location.origin}/api/auth/spotify/callback</code></li>
-                        <li>Copy your <b>Client ID</b> and <b>Client Secret</b> into the app's Secrets panel.</li>
-                      </ol>
+                {!isImportPreviewMode ? (
+                  <div className="space-y-6">
+                    <div className="bg-white/5 p-8 rounded-3xl border border-white/10 space-y-6">
+                      <div className="space-y-2">
+                        <h3 className="text-xl font-bold">Paste your list</h3>
+                        <p className="text-xs text-white/40 leading-relaxed">
+                          Paste a list of songs (one per line). We'll find the best matches on YouTube for you.
+                          <br />
+                          <b>Tip:</b> You can export your Spotify playlists to CSV using <a href="https://www.tunemymusic.com/" target="_blank" className="text-[#1DB954] hover:underline">TuneMyMusic</a> and paste the content here.
+                        </p>
+                      </div>
+                      
+                      <textarea 
+                        value={textImportValue}
+                        onChange={(e) => setTextImportValue(e.target.value)}
+                        placeholder="Artist - Song Name&#10;Artist - Song Name&#10;..."
+                        className="w-full h-64 bg-black/40 border border-white/10 rounded-2xl p-6 text-sm focus:outline-none focus:border-[#1DB954] custom-scrollbar transition-all"
+                      />
+
+                      <button 
+                        onClick={startTextImportPreview}
+                        disabled={!textImportValue.trim() || isTransferring}
+                        className="w-full bg-[#1DB954] text-white py-4 rounded-xl font-bold hover:scale-[1.01] active:scale-[0.99] transition-all disabled:opacity-50 flex items-center justify-center gap-3"
+                      >
+                        {isTransferring ? (
+                          <>
+                            <RefreshCw className="animate-spin" size={20} />
+                            <span>Processing {importProgress.current} / {importProgress.total}</span>
+                          </>
+                        ) : (
+                          <>
+                            <Music size={20} />
+                            <span>Analyze & Import List</span>
+                          </>
+                        )}
+                      </button>
                     </div>
                   </div>
                 ) : (
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-                    <div className="space-y-4">
-                      <div className="flex justify-between items-center">
-                        <h3 className="text-xl font-bold">Your Spotify Playlists</h3>
-                        {isTransferring && importProgress.total > 0 && (
-                          <span className="text-xs text-[#1DB954] font-bold animate-pulse">
-                            Importing: {importProgress.current}/{importProgress.total}
-                          </span>
-                        )}
+                  <div className="space-y-6">
+                    <div className="flex items-center justify-between">
+                      <div className="flex-1 max-w-md">
+                        <label className="text-[10px] font-bold uppercase tracking-widest text-white/40 mb-2 block">Playlist Name</label>
+                        <input 
+                          type="text"
+                          value={importPlaylistName}
+                          onChange={(e) => setImportPlaylistName(e.target.value)}
+                          className="w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 text-lg font-bold focus:outline-none focus:border-[#1DB954]"
+                        />
                       </div>
-                      <div className="space-y-2 max-h-[600px] overflow-y-auto custom-scrollbar pr-2">
-                        {spotifyPlaylists.map((pl, i) => (
-                          <div 
-                            key={`${pl.id}-${i}`}
-                            className={`flex items-center gap-4 p-3 rounded-lg cursor-pointer transition-colors group ${selectedSpotifyPlaylist?.id === pl.id ? 'bg-white/10' : 'hover:bg-white/5'}`}
-                          >
-                            <div className="flex-1 flex items-center gap-4 min-w-0" onClick={() => viewSpotifyPlaylist(pl)}>
-                              <img src={pl.images?.[0]?.url} className="w-12 h-12 rounded object-cover" referrerPolicy="no-referrer" />
-                              <div className="flex-1 min-w-0">
-                                <p className="font-medium truncate">{pl.name}</p>
-                                <p className="text-xs text-white/50">{pl.tracks?.total} tracks</p>
-                              </div>
-                            </div>
-                            <button 
-                              onClick={(e) => { e.stopPropagation(); importSpotifyPlaylist(pl); }}
-                              disabled={isTransferring}
-                              className="opacity-0 group-hover:opacity-100 p-2 bg-[#1DB954] text-white rounded-full transition-all hover:scale-110 disabled:opacity-50"
-                              title="Import entire playlist"
-                            >
-                              <Plus size={16} />
-                            </button>
-                          </div>
-                        ))}
+                      <div className="flex gap-3">
+                        <button 
+                          onClick={() => setIsImportPreviewMode(false)}
+                          className="px-6 py-2 rounded-full text-sm font-bold text-white/60 hover:text-white transition-colors"
+                        >
+                          Back
+                        </button>
+                        <button 
+                          onClick={finalizeImport}
+                          className="bg-white text-black px-8 py-2 rounded-full text-sm font-bold hover:scale-105 transition-transform"
+                        >
+                          Create Playlist
+                        </button>
                       </div>
                     </div>
 
-                    <div className="space-y-4">
-                      <h3 className="text-xl font-bold">
-                        {selectedSpotifyPlaylist ? `Tracks in ${selectedSpotifyPlaylist.name}` : 'Select a playlist'}
-                      </h3>
-                      <div className="space-y-2 max-h-[600px] overflow-y-auto custom-scrollbar pr-2">
-                        {spotifyTracks.map((item, i) => {
-                          const track = item.track;
-                          return (
-                            <div 
-                              key={`${track.id}-${i}`}
-                              className="flex items-center gap-4 p-3 rounded-lg bg-white/5 group"
-                            >
-                              <img src={track.album?.images?.[0]?.url} className="w-10 h-10 rounded object-cover" referrerPolicy="no-referrer" />
-                              <div className="flex-1 min-w-0">
-                                <p className="text-sm font-medium truncate">{track.name}</p>
-                                <p className="text-xs text-white/50 truncate">{track.artists.map((a: any) => a.name).join(', ')}</p>
-                              </div>
+                    <div className="bg-white/5 rounded-3xl border border-white/10 overflow-hidden">
+                      <div className="p-6 border-b border-white/5 bg-white/5">
+                        <h3 className="font-bold">Review Matches ({importPreviewSongs.filter(s => s.song).length} found)</h3>
+                        <p className="text-xs text-white/40">We found these songs on YouTube. Click any song to search for a better match.</p>
+                      </div>
+                      <div className="max-h-[500px] overflow-y-auto custom-scrollbar">
+                        {importPreviewSongs.map((item, idx) => (
+                          <div key={idx} className="flex items-center gap-4 p-4 hover:bg-white/5 border-b border-white/5 group">
+                            <div className="w-8 text-xs text-white/20 font-mono">{idx + 1}</div>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[10px] text-white/30 truncate mb-1 uppercase tracking-tighter">
+                                Source: {item.originalQuery.split(',')[0].replace(/["']/g, '')} {item.originalQuery.split(',')[1]?.replace(/["']/g, '') ? `- ${item.originalQuery.split(',')[1].replace(/["']/g, '')}` : ''}
+                              </p>
+                              {item.song ? (
+                                <div className="flex items-center gap-3">
+                                  <img src={item.song.thumbnail} className="w-10 h-10 rounded object-cover" />
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm font-bold truncate">{item.song.title}</p>
+                                    <p className="text-xs text-white/60 truncate">{item.song.uploaderName}</p>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="flex items-center gap-2 text-amber-500">
+                                  <AlertTriangle size={14} />
+                                  <span className="text-xs font-bold">No match found</span>
+                                </div>
+                              )}
+                            </div>
+                            <div className="opacity-0 group-hover:opacity-100 transition-opacity flex gap-2">
                               <button 
-                                onClick={() => importSpotifyTrack(track)}
-                                disabled={isTransferring}
-                                className="opacity-0 group-hover:opacity-100 p-2 bg-white text-black rounded-full transition-all hover:scale-110 disabled:opacity-50"
+                                onClick={() => {
+                                  setReplacingIndex(idx);
+                                  // Clean up CSV-like queries for better search
+                                  const cleanQuery = item.originalQuery
+                                    .split(',')
+                                    .slice(0, 2)
+                                    .map(s => s.replace(/["']/g, '').trim())
+                                    .join(' ');
+                                  setReplaceSearchQuery(cleanQuery);
+                                }}
+                                className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors"
+                                title="Search for replacement"
                               >
-                                <Plus size={16} />
+                                <Search size={14} />
+                              </button>
+                              <button 
+                                onClick={() => {
+                                  setImportPreviewSongs(prev => prev.filter((_, i) => i !== idx));
+                                }}
+                                className="p-2 bg-red-500/10 text-red-500 rounded-full hover:bg-red-500/20 transition-colors"
+                                title="Remove from import"
+                              >
+                                <X size={14} />
                               </button>
                             </div>
-                          );
-                        })}
-                        {selectedSpotifyPlaylist && spotifyTracks.length === 0 && (
-                          <p className="text-center py-20 text-white/40">No tracks found in this playlist.</p>
-                        )}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   </div>
@@ -1203,10 +1628,10 @@ export default function App() {
                 <section>
                   <div className="flex items-center justify-between mb-6">
                     <h2 className="text-2xl font-bold">Recommended for You</h2>
-                    <p className="text-sm text-white/40">Based on your liked songs</p>
+                    <p className="text-sm text-white/40">Based on your listening habits</p>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                    {(likedSongs.length > 0 ? likedSongs.sort(() => Math.random() - 0.5).slice(0, 6) : discoverySongs.slice(0, 6)).map((song, i) => (
+                    {recommendations.map((song, i) => (
                       <SongRow 
                         key={`rec-${song.id}-${i}`} 
                         song={song}
@@ -1223,6 +1648,32 @@ export default function App() {
                     ))}
                   </div>
                 </section>
+
+                {recentlyPlayed.length > 0 && (
+                  <section>
+                    <div className="flex items-center justify-between mb-6">
+                      <h2 className="text-2xl font-bold">Recently Played</h2>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-6">
+                      {recentlyPlayed.slice(0, 6).map((song, i) => (
+                        <div 
+                          key={`recent-${song.id}-${i}`}
+                          onClick={() => playSong(song)}
+                          className="bg-white/5 p-4 rounded-xl hover:bg-white/10 transition-all cursor-pointer group"
+                        >
+                          <div className="relative aspect-square mb-4 shadow-2xl">
+                            <img src={song.thumbnail} className="w-full h-full object-cover rounded-lg" />
+                            <button className="absolute bottom-2 right-2 w-10 h-10 bg-[#1DB954] text-white rounded-full shadow-xl opacity-0 group-hover:opacity-100 transition-all flex items-center justify-center translate-y-2 group-hover:translate-y-0">
+                              <Play size={18} className="fill-white" />
+                            </button>
+                          </div>
+                          <p className="font-bold text-sm truncate mb-1">{song.title}</p>
+                          <p className="text-xs text-white/40 truncate">{song.uploaderName}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                )}
 
                 <section>
                   <div className="flex items-center justify-between mb-6">
@@ -1439,6 +1890,73 @@ export default function App() {
               <div className="flex justify-end gap-4">
                 <button onClick={() => setIsCreatePlaylistOpen(false)} className="px-6 py-2 text-white/50 hover:text-white font-medium">Cancel</button>
                 <button onClick={createPlaylist} className="bg-white text-black px-8 py-2 rounded-full font-bold">Create</button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {/* Replace Song Modal */}
+        {replacingIndex !== null && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+            <motion.div 
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-[#181818] w-full max-w-lg rounded-3xl border border-white/10 overflow-hidden shadow-2xl"
+            >
+              <div className="p-6 border-b border-white/5 flex items-center justify-between">
+                <h3 className="text-xl font-bold">Replace Song</h3>
+                <button onClick={() => setReplacingIndex(null)} className="text-white/40 hover:text-white">
+                  <X size={20} />
+                </button>
+              </div>
+                <div className="p-6 space-y-6">
+                  <form onSubmit={handleReplaceSearch} className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-white/40" size={18} />
+                      <input 
+                        autoFocus
+                        type="text"
+                        value={replaceSearchQuery}
+                        onChange={(e) => setReplaceSearchQuery(e.target.value)}
+                        placeholder="Search for a song or artist..."
+                        className="w-full bg-white/5 border border-white/10 rounded-xl pl-10 pr-4 py-3 text-sm focus:outline-none focus:border-[#1DB954] transition-all"
+                      />
+                    </div>
+                    <button 
+                      type="submit"
+                      className="bg-[#1DB954] text-white px-6 rounded-xl font-bold hover:scale-105 transition-transform"
+                    >
+                      Search
+                    </button>
+                  </form>
+
+                <div className="max-h-[300px] overflow-y-auto custom-scrollbar space-y-2">
+                  {isReplaceSearching ? (
+                    <div className="py-12 flex justify-center">
+                      <RefreshCw className="animate-spin text-[#1DB954]" size={32} />
+                    </div>
+                  ) : replaceSearchResults.length > 0 ? (
+                    replaceSearchResults.map((song) => (
+                      <div 
+                        key={song.id}
+                        onClick={() => selectReplacement(song)}
+                        className="flex items-center gap-4 p-3 rounded-xl hover:bg-white/5 cursor-pointer transition-colors group"
+                      >
+                        <img src={song.thumbnail} className="w-12 h-12 rounded object-cover" />
+                        <div className="flex-1 min-w-0">
+                          <p className="font-bold truncate group-hover:text-[#1DB954] transition-colors">{song.title}</p>
+                          <p className="text-xs text-white/60 truncate">{song.uploaderName}</p>
+                        </div>
+                        <Plus size={18} className="text-white/20 group-hover:text-white" />
+                      </div>
+                    ))
+                  ) : (
+                    <div className="py-12 text-center text-white/20 text-sm italic">
+                      {replaceSearchQuery ? "No results found." : "Search to find a replacement."}
+                    </div>
+                  )}
+                </div>
               </div>
             </motion.div>
           </div>
