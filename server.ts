@@ -1,7 +1,8 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import ytSearch from "yt-search";
+import ytSearchModule from "yt-search";
+const ytSearch = (ytSearchModule as any).default || ytSearchModule;
 import cookieParser from "cookie-parser";
 import axios from "axios";
 import dotenv from "dotenv";
@@ -364,17 +365,25 @@ async function startServer() {
   });
 
   // API route to get songs for an artist
-  app.get("/api/artist/:name", async (req, res) => {
-    const artistName = req.params.name;
+  app.get("/api/artist", async (req, res) => {
+    const artistName = req.query.name as string;
+    if (!artistName) {
+      return res.status(400).json({ error: "Artist name is required" });
+    }
     try {
       console.log(`YouTube Search: Fetching songs for artist "${artistName}"...`);
       const searchResults = await ytSearch(`${artistName} songs`);
+      
+      if (!searchResults || !searchResults.videos) {
+        return res.json({ items: [] });
+      }
+
       const items = searchResults.videos.slice(0, 20).map((v: any) => ({
         id: v.videoId,
         title: v.title,
         thumbnail: v.thumbnail,
-        uploaderName: v.author.name,
-        duration: v.duration.timestamp,
+        uploaderName: v.author?.name || artistName,
+        duration: v.duration?.timestamp || '',
       }));
       res.json({ items });
     } catch (err) {

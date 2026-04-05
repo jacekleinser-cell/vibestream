@@ -745,7 +745,7 @@ export default function App() {
     if (seedArtists.length > 0) {
       const randomArtist = seedArtists[Math.floor(Math.random() * seedArtists.length)];
       try {
-        const data = await safeFetch(`/api/artist/${encodeURIComponent(randomArtist)}`);
+        const data = await safeFetch(`/api/artist?name=${encodeURIComponent(randomArtist)}`);
         if (data.items && data.items.length > 0) {
           setRecommendations(data.items.slice(0, 6));
         }
@@ -835,7 +835,7 @@ export default function App() {
     setSelectedPlaylist(null);
     setIsSearchOpen(false);
     try {
-      const data = await safeFetch(`/api/artist/${encodeURIComponent(artistName)}`);
+      const data = await safeFetch(`/api/artist?name=${encodeURIComponent(artistName)}`);
       setArtistSongs(data.items || []);
     } catch (err: any) {
       console.error("Artist search error:", err);
