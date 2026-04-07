@@ -6,6 +6,12 @@ import {
   Volume2, VolumeX, Repeat, LayoutGrid, List, RefreshCw, AlertTriangle, Download, User, LogOut, Globe, Share2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { 
+  auth, db, googleProvider, signInWithPopup, onAuthStateChanged, signOut, 
+  createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  doc, setDoc, getDoc, collection, query as queryFirestore, where, getDocs, onSnapshot, 
+  Timestamp, deleteDoc, handleFirestoreError, OperationType, FirebaseUser 
+} from './firebase';
 
 interface Song {
   id: string;
@@ -143,6 +149,7 @@ export default function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
   const [discoverySongs, setDiscoverySongs] = useState<Song[]>([]);
   const [discoveryCategory, setDiscoveryCategory] = useState('Trending');
+  const [communityPlaylists, setCommunityPlaylists] = useState<any[]>([]);
   const [isDiscoveryLoading, setIsDiscoveryLoading] = useState(false);
   const [featuredDiscoverySong, setFeaturedDiscoverySong] = useState<Song | null>(null);
 
@@ -180,10 +187,11 @@ export default function App() {
   const [isSpotifyTracksLoading, setIsSpotifyTracksLoading] = useState(false);
   const [isTransferring, setIsTransferring] = useState(false);
   const [importProgress, setImportProgress] = useState({ current: 0, total: 0 });
-  const [user, setUser] = useState<{ id: number, username: string } | null>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
-  const [authForm, setAuthForm] = useState({ username: '', password: '' });
+  const [authForm, setAuthForm] = useState({ email: '', password: '' });
   const [authError, setAuthError] = useState('');
   const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
@@ -197,60 +205,89 @@ export default function App() {
   }, []);
 
   // --- Auth & Sync Logic ---
-  const checkAuth = useCallback(async () => {
-    try {
-      const res = await fetch('/api/auth/me');
-      if (res.ok) {
-        const data = await res.json();
-        setUser(data.user);
-        fetchUserData();
-      } else if (res.status === 401) {
-        setUser(null);
-      }
-    } catch (e) {
-      setUser(null);
-    }
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      setUser(firebaseUser);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
   }, []);
 
-  const fetchUserData = async () => {
-    try {
-      const res = await fetch('/api/user/data');
-      if (res.ok) {
-        const { data } = await res.json();
-        if (data) {
-          if (data.likedSongs) setLikedSongs(data.likedSongs);
-          if (data.playlists) setPlaylists(data.playlists);
-          if (data.favoriteArtists) setFavoriteArtists(data.favoriteArtists);
-        }
-      } else if (res.status === 401) {
-        setUser(null);
+  useEffect(() => {
+    if (!user) {
+      setLikedSongs([]);
+      setPlaylists([]);
+      setFavoriteArtists([]);
+      return;
+    }
+
+    const unsubscribe = onSnapshot(doc(db, 'users', user.uid), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.likedSongs) setLikedSongs(data.likedSongs);
+        if (data.playlists) setPlaylists(data.playlists);
+        if (data.favoriteArtists) setFavoriteArtists(data.favoriteArtists);
       }
-    } catch (e) {}
-  };
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  useEffect(() => {
+    const unsubscribe = onSnapshot(collection(db, 'public_playlists'), (snapshot) => {
+      const playlists = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setCommunityPlaylists(playlists);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'public_playlists');
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+
+    const userDocRef = doc(db, 'users', user.uid);
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.likedSongs) setLikedSongs(data.likedSongs);
+        if (data.playlists) setPlaylists(data.playlists);
+        if (data.favoriteArtists) setFavoriteArtists(data.favoriteArtists);
+      } else {
+        // Initialize user doc if it doesn't exist
+        setDoc(userDocRef, {
+          uid: user.uid,
+          username: user.displayName || user.email?.split('@')[0] || 'User',
+          likedSongs: [],
+          playlists: [],
+          favoriteArtists: [],
+          updatedAt: Timestamp.now()
+        }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
+      }
+    }, (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}`));
+
+    return () => unsubscribe();
+  }, [user]);
 
   const syncUserData = useCallback(async () => {
     if (!user) return;
     try {
-      const res = await fetch('/api/user/data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          data: {
-            likedSongs,
-            playlists,
-            favoriteArtists
-          }
-        })
-      });
-      if (res.status === 401) {
-        setUser(null);
-      }
-    } catch (e) {}
+      const userDocRef = doc(db, 'users', user.uid);
+      await setDoc(userDocRef, {
+        likedSongs,
+        playlists,
+        favoriteArtists,
+        updatedAt: Timestamp.now()
+      }, { merge: true });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
+    }
   }, [user, likedSongs, playlists, favoriteArtists]);
-
-  useEffect(() => {
-    checkAuth();
-  }, [checkAuth]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -259,37 +296,53 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [syncUserData]);
 
-  const handleAuth = async (e: FormEvent) => {
-    e.preventDefault();
-    setAuthError('');
-    setIsAuthLoading(true);
+  const handleGoogleLogin = async () => {
     try {
-      const endpoint = authMode === 'login' ? '/api/auth/login' : '/api/auth/register';
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(authForm)
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setUser(data.user);
-        setIsAuthModalOpen(false);
-        showToast(authMode === 'login' ? 'Logged in successfully' : 'Registered successfully', 'success');
-        fetchUserData();
+      setIsAuthLoading(true);
+      setAuthError('');
+      await signInWithPopup(auth, googleProvider);
+      setIsAuthModalOpen(false);
+      showToast('Logged in with Google', 'success');
+    } catch (err: any) {
+      console.error("Login error:", err);
+      setAuthError(err.message);
+      showToast(`Login failed: ${err.message}`, 'error');
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  const handleEmailAuth = async (e: FormEvent) => {
+    e.preventDefault();
+    setIsAuthLoading(true);
+    setAuthError('');
+    try {
+      if (authMode === 'register') {
+        await createUserWithEmailAndPassword(auth, authForm.email, authForm.password);
+        showToast('Account created successfully!', 'success');
       } else {
-        setAuthError(data.error || 'Authentication failed');
+        await signInWithEmailAndPassword(auth, authForm.email, authForm.password);
+        showToast('Logged in successfully!', 'success');
       }
-    } catch (err) {
-      setAuthError('An error occurred');
+      setIsAuthModalOpen(false);
+      setAuthForm({ email: '', password: '' });
+    } catch (err: any) {
+      console.error("Auth error:", err);
+      setAuthError(err.message);
+      showToast(err.message, 'error');
     } finally {
       setIsAuthLoading(false);
     }
   };
 
   const logout = async () => {
-    await fetch('/api/auth/logout', { method: 'POST' });
-    setUser(null);
-    showToast('Logged out', 'info');
+    try {
+      await signOut(auth);
+      setUser(null);
+      showToast('Logged out', 'info');
+    } catch (err: any) {
+      showToast(`Logout failed: ${err.message}`, 'error');
+    }
   };
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -822,38 +875,87 @@ export default function App() {
   const startTextImportPreview = async () => {
     if (!textImportValue.trim()) return;
     
-    let lines = textImportValue.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    if (lines.length > 0 && (lines[0].toLowerCase().includes('track') || lines[0].toLowerCase().includes('artist'))) {
-      lines = lines.slice(1);
-    }
-    if (lines.length === 0) return;
-
     setIsTransferring(true);
-    setImportProgress({ current: 0, total: lines.length });
-    const previewItems: { originalQuery: string, song: Song | null }[] = [];
+    setImportProgress({ current: 0, total: 1 }); // Initial stage
     
     try {
-      for (let i = 0; i < lines.length; i++) {
-        let query = lines[i];
-        if (query.includes(',')) {
-          query = query.replace(/"/g, '').replace(/,/g, ' ');
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
+
+      // Step 1: Use AI to parse and clean the list
+      const parsePrompt = `
+        You are an expert music librarian. I have a messy list of songs/tracks. 
+        Please parse this list and return a clean JSON array of objects, where each object has "artist" and "title" fields.
+        If a line doesn't look like a song, skip it.
+        Input:
+        ${textImportValue}
+        
+        Return ONLY the JSON array.
+      `;
+
+      const parseResponse = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: parsePrompt,
+        config: {
+          responseMimeType: "application/json"
         }
-        setImportProgress({ current: i + 1, total: lines.length });
+      });
+      
+      const parseText = parseResponse.text || "[]";
+      const jsonMatch = parseText.match(/\[[\s\S]*\]/);
+      
+      if (!jsonMatch) {
+        throw new Error("Could not parse the song list. Please check the format.");
+      }
+
+      const parsedSongs: { artist: string, title: string }[] = JSON.parse(jsonMatch[0]);
+      
+      if (parsedSongs.length === 0) {
+        throw new Error("No songs found in the input.");
+      }
+
+      setImportProgress({ current: 0, total: parsedSongs.length });
+      const previewItems: { originalQuery: string, song: Song | null }[] = [];
+      
+      // Step 2: Search for each song with optimized queries
+      for (let i = 0; i < parsedSongs.length; i++) {
+        const { artist, title } = parsedSongs[i];
+        const originalQuery = `${artist} - ${title}`;
+        // Optimized query for better matching
+        const optimizedQuery = `${artist} ${title} official audio`;
+        
+        setImportProgress({ current: i + 1, total: parsedSongs.length });
         
         try {
-          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
-          const firstVideo = searchData.items.find((item: any) => item.type === 'video');
-          previewItems.push({ originalQuery: lines[i], song: firstVideo || null });
-          await new Promise(resolve => setTimeout(resolve, 200));
+          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(optimizedQuery)}`);
+          const items = searchData.items || [];
+          
+          // Find the best match: prefer official audio or high quality videos
+          let bestMatch = items.find((item: any) => 
+            item.type === 'video' && 
+            (item.title.toLowerCase().includes('official') || item.title.toLowerCase().includes('audio'))
+          );
+          
+          if (!bestMatch) {
+            bestMatch = items.find((item: any) => item.type === 'video');
+          }
+
+          previewItems.push({ originalQuery, song: bestMatch || null });
+          
+          // Small delay to avoid rate limits
+          if (i < parsedSongs.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 300));
+          }
         } catch (e) {
-          previewItems.push({ originalQuery: lines[i], song: null });
+          previewItems.push({ originalQuery, song: null });
         }
       }
+
       setImportPreviewSongs(previewItems);
       setIsImportPreviewMode(true);
-      setImportPlaylistName(`My Import ${new Date().toLocaleDateString()}`);
+      setImportPlaylistName(`Imported ${new Date().toLocaleDateString()}`);
     } catch (err: any) {
-      showToast(`Failed to process list: ${err.message}`, 'error');
+      console.error("Import error:", err);
+      showToast(`Import failed: ${err.message}`, 'error');
     } finally {
       setIsTransferring(false);
       setImportProgress({ current: 0, total: 0 });
@@ -968,6 +1070,7 @@ export default function App() {
   }, [discoveryCategory]);
 
   const fetchDiscoverySongs = async (category: string) => {
+    if (category === 'Community') return;
     setIsDiscoveryLoading(true);
     try {
       const query = category === 'Trending' ? 'popular songs 2026' : `${category} hits 2026`;
@@ -1005,10 +1108,27 @@ export default function App() {
     try {
       const data = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
       const items = data.items || [];
+      
+      // Search Firestore for public playlists
+      const publicPlaylistsQuery = queryFirestore(
+        collection(db, 'public_playlists'),
+        where('title', '>=', query),
+        where('title', '<=', query + '\uf8ff')
+      );
+      const publicPlaylistsSnap = await getDocs(publicPlaylistsQuery);
+      const firestorePlaylists = publicPlaylistsSnap.docs.map(doc => ({
+        ...doc.data(),
+        type: 'public_playlist',
+        thumbnail: doc.data().songs?.[0]?.thumbnail || ''
+      }));
+
       setSearchResults({
         songs: items.filter((i: any) => i.type === 'video'),
         artists: items.filter((i: any) => i.type === 'channel'),
-        playlists: items.filter((i: any) => i.type === 'playlist' || i.type === 'public_playlist'),
+        playlists: [
+          ...items.filter((i: any) => i.type === 'playlist'),
+          ...firestorePlaylists
+        ],
         albums: []
       });
     } catch (err: any) {
@@ -1249,30 +1369,24 @@ export default function App() {
     }
     
     try {
-      const res = await fetch('/api/playlists/publish', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: `${pl.name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${user.id}`,
-          title: pl.name,
-          description: `A playlist by ${user.username}`,
-          songs: pl.songs
-        })
+      const playlistId = `pl_${Date.now()}`;
+      const playlistDocRef = doc(db, 'public_playlists', playlistId);
+      
+      await setDoc(playlistDocRef, {
+        id: playlistId,
+        userId: user.uid,
+        username: user.displayName || user.email?.split('@')[0] || 'User',
+        title: pl.name,
+        description: `A playlist by ${user.displayName || user.email?.split('@')[0]}`,
+        songs: pl.songs,
+        createdAt: Timestamp.now()
       });
-      
-      const data = await res.json();
-      
-      if (res.ok && data.success) {
-        showToast('Playlist published successfully!', 'success');
-      } else if (res.status === 401) {
-        setUser(null);
-        showToast('Session expired. Please sign in again.', 'error');
-      } else {
-        throw new Error(data.error || 'Failed to publish');
-      }
+
+      showToast('Playlist published successfully!', 'success');
     } catch (err: any) {
       console.error("Publish error:", err);
-      showToast(err.message || 'Failed to publish playlist', 'error');
+      handleFirestoreError(err, OperationType.WRITE, 'public_playlists');
+      showToast(`Failed to publish playlist: ${err.message}`, 'error');
     }
   };
 
@@ -1427,6 +1541,19 @@ export default function App() {
     playRecommendationRef.current = playRecommendation;
   }, [playRecommendation]);
 
+  if (!isAuthReady) {
+    return (
+      <div className="fixed inset-0 bg-bg-main flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-700 flex items-center justify-center animate-pulse shadow-2xl shadow-indigo-500/20">
+            <Music className="text-white fill-white" size={32} />
+          </div>
+          <p className="text-white/40 text-xs font-bold uppercase tracking-widest animate-pulse">TuneTrail</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen bg-bg-main text-white overflow-hidden">
       {/* Toast Notification */}
@@ -1556,8 +1683,8 @@ export default function App() {
                   <User size={16} />
                 </div>
                 <div className="min-w-0">
-                  <p className="text-sm font-bold truncate">{user.username}</p>
-                  <p className="text-[10px] text-white/40 uppercase tracking-widest">Premium User</p>
+                  <p className="text-sm font-bold truncate">{user.displayName || user.email?.split('@')[0] || 'User'}</p>
+                  <p className="text-[10px] text-white/40 uppercase tracking-widest">User</p>
                 </div>
               </div>
               <button onClick={logout} className="p-2 text-white/40 hover:text-red-500 transition-colors" title="Logout">
@@ -1640,8 +1767,8 @@ export default function App() {
             {user ? (
               <div className="flex items-center gap-3 pl-4 border-l border-white/10">
                 <div className="hidden sm:block text-right">
-                  <p className="text-xs font-bold truncate max-w-[100px]">{user.username}</p>
-                  <p className="text-[10px] text-white/40 uppercase tracking-widest">Premium</p>
+                  <p className="text-xs font-bold truncate max-w-[100px]">{user.displayName || user.email?.split('@')[0] || 'User'}</p>
+                  <p className="text-[10px] text-white/40 uppercase tracking-widest">Member</p>
                 </div>
                 <div 
                   className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center flex-shrink-0 cursor-pointer hover:scale-105 transition-transform" 
@@ -2099,9 +2226,9 @@ export default function App() {
                     <RefreshCw size={40} className={`text-white ${isTransferring ? 'animate-spin' : ''}`} />
                   </div>
                   <div>
-                    <h4 className="text-xs font-bold uppercase tracking-widest mb-1 text-white/40">Magic Importer</h4>
+                    <h4 className="text-xs font-bold uppercase tracking-widest mb-1 text-white/40">AI-Powered Importer</h4>
                     <h1 className="text-4xl font-black mb-2">Transfer Your Music</h1>
-                    <p className="text-white/60 text-sm">Paste a list of songs from Spotify, Apple Music, or anywhere else.</p>
+                    <p className="text-white/60 text-sm">Our AI accurately parses your list and finds the perfect matches on YouTube.</p>
                   </div>
                 </div>
 
@@ -2154,7 +2281,7 @@ export default function App() {
                         ) : (
                           <>
                             <Music size={20} />
-                            <span>Analyze & Import List</span>
+                            <span>AI Analyze & Import</span>
                           </>
                         )}
                       </button>
@@ -2457,7 +2584,7 @@ export default function App() {
 
                 <section>
                   <div className="flex items-center gap-4 overflow-x-auto pb-4 no-scrollbar">
-                    {['Trending', 'Pop', 'Hip Hop', 'Rock', 'Electronic', 'Country'].map(cat => (
+                    {['Trending', 'Community', 'Pop', 'Hip Hop', 'Rock', 'Electronic', 'Country'].map(cat => (
                       <button
                         key={cat}
                         onClick={() => setDiscoveryCategory(cat)}
@@ -2468,7 +2595,36 @@ export default function App() {
                     ))}
                   </div>
                   
-                  {isDiscoveryLoading ? (
+                  {discoveryCategory === 'Community' ? (
+                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-6">
+                      {communityPlaylists.map((pl, i) => (
+                        <div 
+                          key={`community-${pl.id}-${i}`}
+                          onClick={() => viewPlaylist({ name: pl.title, songs: pl.songs })}
+                          className="bg-white/5 p-4 rounded-xl hover:bg-white/10 transition-all cursor-pointer group"
+                        >
+                          <div className="relative aspect-square mb-4 shadow-2xl">
+                            <img src={pl.songs?.[0]?.thumbnail || 'https://picsum.photos/seed/playlist/300/300'} className="w-full h-full object-cover rounded-lg" />
+                            <div className="absolute bottom-2 right-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-all translate-y-2 group-hover:translate-y-0">
+                              <button 
+                                className="w-10 h-10 bg-indigo-600 text-white rounded-full shadow-xl flex items-center justify-center"
+                              >
+                                <Play size={18} className="fill-white" />
+                              </button>
+                            </div>
+                          </div>
+                          <p className="font-bold text-sm truncate mb-1">{pl.title}</p>
+                          <p className="text-xs text-white/40 truncate">By {pl.username}</p>
+                        </div>
+                      ))}
+                      {communityPlaylists.length === 0 && (
+                        <div className="col-span-full py-12 text-center text-white/20">
+                          <Globe size={48} className="mx-auto mb-4 opacity-20" />
+                          <p>No community playlists yet. Be the first to publish!</p>
+                        </div>
+                      )}
+                    </div>
+                  ) : isDiscoveryLoading ? (
                     <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
                       {[...Array(6)].map((_, i) => (
                         <div key={i} className="h-16 bg-white/5 rounded-lg animate-pulse" />
@@ -2924,56 +3080,102 @@ export default function App() {
                 </button>
               </div>
 
-              <form onSubmit={handleAuth} className="space-y-4">
-                {authError && (
-                  <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-center gap-3 text-red-400 text-sm">
-                    <AlertTriangle size={18} />
-                    {authError}
-                  </div>
-                )}
-                
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-white/40 ml-1">Username</label>
-                  <input 
-                    type="text" 
-                    required
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:border-indigo-500 transition-colors"
-                    placeholder="Enter your username"
-                    value={authForm.username}
-                    onChange={e => setAuthForm({ ...authForm, username: e.target.value })}
-                  />
-                </div>
-
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-white/40 ml-1">Password</label>
-                  <input 
-                    type="password" 
-                    required
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:border-indigo-500 transition-colors"
-                    placeholder="••••••••"
-                    value={authForm.password}
-                    onChange={e => setAuthForm({ ...authForm, password: e.target.value })}
-                  />
-                </div>
-
+              <div className="space-y-6">
                 <button 
-                  type="submit"
+                  onClick={handleGoogleLogin}
                   disabled={isAuthLoading}
-                  className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 py-4 rounded-xl font-bold text-lg transition-all shadow-xl shadow-indigo-600/20 mt-4"
+                  className="w-full bg-white text-black hover:bg-white/90 disabled:opacity-50 py-4 rounded-xl font-bold text-lg transition-all shadow-xl flex items-center justify-center gap-3"
                 >
-                  {isAuthLoading ? <RefreshCw className="animate-spin mx-auto" /> : (authMode === 'login' ? 'Sign In' : 'Create Account')}
+                  {isAuthLoading ? (
+                    <RefreshCw className="animate-spin" />
+                  ) : (
+                    <>
+                      <svg className="w-5 h-5" viewBox="0 0 24 24">
+                        <path
+                          fill="currentColor"
+                          d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
+                        />
+                        <path
+                          fill="#34A853"
+                          d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+                        />
+                        <path
+                          fill="#FBBC05"
+                          d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"
+                        />
+                        <path
+                          fill="#EA4335"
+                          d="M12 5.38c1.62 0 3.06.56 4.21 1.66l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+                        />
+                      </svg>
+                      Continue with Google
+                    </>
+                  )}
                 </button>
-              </form>
 
-              <div className="mt-8 text-center">
-                <p className="text-white/40 text-sm">
-                  {authMode === 'login' ? "Don't have an account?" : "Already have an account?"}
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-white/10"></div>
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase">
+                    <span className="bg-bg-card px-2 text-white/20">Or continue with email</span>
+                  </div>
+                </div>
+
+                <form onSubmit={handleEmailAuth} className="space-y-4">
+                  {authError && (
+                    <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-xl flex items-center gap-3 text-red-400 text-xs">
+                      <AlertTriangle size={16} />
+                      {authError}
+                    </div>
+                  )}
+                  
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-white/40 ml-1">Email Address</label>
+                    <input 
+                      type="email" 
+                      required
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:border-indigo-500 transition-colors text-sm"
+                      placeholder="name@example.com"
+                      value={authForm.email}
+                      onChange={e => setAuthForm({ ...authForm, email: e.target.value })}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-bold uppercase tracking-widest text-white/40 ml-1">Password</label>
+                    <input 
+                      type="password" 
+                      required
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 focus:outline-none focus:border-indigo-500 transition-colors text-sm"
+                      placeholder="••••••••"
+                      value={authForm.password}
+                      onChange={e => setAuthForm({ ...authForm, password: e.target.value })}
+                    />
+                  </div>
+
                   <button 
-                    onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}
-                    className="ml-2 text-indigo-400 font-bold hover:underline"
+                    type="submit"
+                    disabled={isAuthLoading}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 py-4 rounded-xl font-bold text-lg transition-all shadow-xl shadow-indigo-600/20 mt-4"
                   >
-                    {authMode === 'login' ? 'Sign Up' : 'Log In'}
+                    {isAuthLoading ? <RefreshCw className="animate-spin mx-auto" /> : (authMode === 'login' ? 'Sign In' : 'Create Account')}
                   </button>
+
+                  <p className="text-center text-sm text-white/40 mt-6">
+                    {authMode === 'login' ? "Don't have an account?" : "Already have an account?"}
+                    <button 
+                      type="button"
+                      onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}
+                      className="ml-2 text-indigo-400 font-bold hover:underline"
+                    >
+                      {authMode === 'login' ? 'Sign Up' : 'Sign In'}
+                    </button>
+                  </p>
+                </form>
+                
+                <p className="text-center text-[10px] text-white/20 px-4">
+                  By continuing, you agree to TuneTrail's Terms of Service and Privacy Policy.
                 </p>
               </div>
             </motion.div>
@@ -3002,8 +3204,8 @@ export default function App() {
                   <User size={48} />
                 </div>
                 <div className="text-center">
-                  <h3 className="text-2xl font-bold">{user.username}</h3>
-                  <p className="text-white/40 text-sm">Premium Member since 2026</p>
+                  <h3 className="text-2xl font-bold">{user.displayName || user.email?.split('@')[0] || 'User'}</h3>
+                  <p className="text-white/40 text-sm">{user.email}</p>
                 </div>
               </div>
 

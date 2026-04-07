@@ -13,212 +13,12 @@ import jwt from "jsonwebtoken";
 
 dotenv.config();
 
-const db_sqlite = new Database("music_app.db");
-db_sqlite.pragma('foreign_keys = ON');
-
-// Initialize database tables
-db_sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS user_data (
-    user_id INTEGER PRIMARY KEY,
-    data TEXT NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS public_playlists (
-    id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL,
-    username TEXT NOT NULL,
-    title TEXT NOT NULL,
-    description TEXT,
-    songs TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-`);
-
-const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret_for_dev";
-
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
   app.use(cookieParser());
-
-  // Authentication Middleware
-  const authenticateToken = (req: any, res: any, next: any) => {
-    const token = req.cookies.auth_token;
-    if (!token) return res.status(401).json({ error: "Unauthorized" });
-
-    jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
-      if (err) return res.status(403).json({ error: "Forbidden" });
-      
-      // Check if user still exists in DB
-      const user: any = db_sqlite.prepare("SELECT id, username FROM users WHERE id = ?").get(decoded.id);
-      if (!user) {
-        res.clearCookie("auth_token");
-        return res.status(401).json({ error: "Session expired. Please sign in again." });
-      }
-      
-      req.user = user;
-      next();
-    });
-  };
-
-  // Auth Routes
-  app.post("/api/auth/register", async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Missing credentials" });
-
-    try {
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const stmt = db_sqlite.prepare("INSERT INTO users (username, password) VALUES (?, ?)");
-      const result = stmt.run(username, hashedPassword);
-      
-      const token = jwt.sign({ id: result.lastInsertRowid, username }, JWT_SECRET, { expiresIn: "30d" });
-      res.cookie("auth_token", token, { httpOnly: true, secure: true, sameSite: "none", maxAge: 30 * 24 * 60 * 60 * 1000 });
-      
-      res.json({ success: true, user: { id: result.lastInsertRowid, username } });
-    } catch (err: any) {
-      if (err.message.includes("UNIQUE constraint failed")) {
-        return res.status(400).json({ error: "Username already exists" });
-      }
-      res.status(500).json({ error: "Registration failed" });
-    }
-  });
-
-  app.post("/api/auth/login", async (req, res) => {
-    const { username, password } = req.body;
-    if (!username || !password) return res.status(400).json({ error: "Missing credentials" });
-
-    try {
-      const user: any = db_sqlite.prepare("SELECT * FROM users WHERE username = ?").get(username);
-      if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).json({ error: "Invalid credentials" });
-      }
-
-      const token = jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: "30d" });
-      res.cookie("auth_token", token, { httpOnly: true, secure: true, sameSite: "none", maxAge: 30 * 24 * 60 * 60 * 1000 });
-      
-      res.json({ success: true, user: { id: user.id, username: user.username } });
-    } catch (err) {
-      res.status(500).json({ error: "Login failed" });
-    }
-  });
-
-  app.post("/api/auth/logout", (req, res) => {
-    res.clearCookie("auth_token");
-    res.json({ success: true });
-  });
-
-  app.get("/api/auth/me", (req, res) => {
-    const token = req.cookies.auth_token;
-    if (!token) return res.status(401).json({ error: "Not logged in" });
-
-    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-      if (err) return res.status(403).json({ error: "Invalid token" });
-      res.json({ user });
-    });
-  });
-
-  // User Data Sync Routes
-  app.get("/api/user/data", authenticateToken, (req: any, res) => {
-    try {
-      const row: any = db_sqlite.prepare("SELECT data FROM user_data WHERE user_id = ?").get(req.user.id);
-      res.json({ data: row ? JSON.parse(row.data) : null });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to fetch user data" });
-    }
-  });
-
-  app.post("/api/user/data", authenticateToken, (req: any, res) => {
-    const { data } = req.body;
-    try {
-      const dataStr = JSON.stringify(data);
-      db_sqlite.prepare(`
-        INSERT INTO user_data (user_id, data, updated_at) 
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = CURRENT_TIMESTAMP
-      `).run(req.user.id, dataStr);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to save user data" });
-    }
-  });
-
-  // Public Playlist Routes
-  app.post("/api/playlists/publish", authenticateToken, (req: any, res) => {
-    const { id, title, description, songs } = req.body;
-    if (!id || !title || !songs) return res.status(400).json({ error: "Missing playlist data" });
-
-    try {
-      db_sqlite.prepare(`
-        INSERT INTO public_playlists (id, user_id, username, title, description, songs)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET 
-          title = excluded.title, 
-          description = excluded.description, 
-          songs = excluded.songs
-      `).run(id, req.user.id, req.user.username, title, description, JSON.stringify(songs));
-      res.json({ success: true });
-    } catch (err: any) {
-      console.error("Publish Playlist Error:", err.message);
-      res.status(500).json({ error: `Failed to publish playlist: ${err.message}` });
-    }
-  });
-
-  app.get("/api/playlists/public", (req, res) => {
-    const q = req.query.q as string;
-    try {
-      let playlists;
-      if (q) {
-        playlists = db_sqlite.prepare(`
-          SELECT id, username, title, description, songs, created_at 
-          FROM public_playlists 
-          WHERE title LIKE ? OR username LIKE ? 
-          ORDER BY created_at DESC LIMIT 50
-        `).all(`%${q}%`, `%${q}%`);
-      } else {
-        playlists = db_sqlite.prepare(`
-          SELECT id, username, title, description, songs, created_at 
-          FROM public_playlists 
-          ORDER BY created_at DESC LIMIT 50
-        `).all();
-      }
-      
-      res.json({ 
-        playlists: playlists.map((p: any) => ({
-          ...p,
-          songs: JSON.parse(p.songs)
-        }))
-      });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to fetch public playlists" });
-    }
-  });
-
-  app.get("/api/playlists/public/:id", (req, res) => {
-    try {
-      const playlist: any = db_sqlite.prepare("SELECT * FROM public_playlists WHERE id = ?").get(req.params.id);
-      if (!playlist) return res.status(404).json({ error: "Playlist not found" });
-      res.json({ 
-        playlist: {
-          ...playlist,
-          songs: JSON.parse(playlist.songs)
-        } 
-      });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to fetch playlist" });
-    }
-  });
 
   // Spotify OAuth Config
   const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID?.trim();
@@ -524,14 +324,6 @@ async function startServer() {
       console.log(`YouTube Search: Searching for "${query}"...`);
       const searchResults = await ytSearch(query);
       
-      // Search for public playlists in our database
-      const dbPlaylists = db_sqlite.prepare(`
-        SELECT id, username, title, description, songs 
-        FROM public_playlists 
-        WHERE title LIKE ? OR username LIKE ? 
-        LIMIT 20
-      `).all(`%${query}%`, `%${query}%`);
-
       // Filter and sort videos
       const filteredVideos = searchResults.videos
         .filter((v: any) => {
@@ -558,16 +350,7 @@ async function startServer() {
           duration: v.duration.timestamp 
         })),
         ...searchResults.channels.slice(0, 5).map((c: any) => ({ type: 'channel', id: c.channelId, title: c.name, thumbnail: c.thumbnail, uploaderName: c.name, duration: '' })),
-        ...searchResults.playlists.slice(0, 5).map((p: any) => ({ type: 'playlist', id: p.listId, title: p.title, thumbnail: p.thumbnail, uploaderName: p.author.name, duration: '' })),
-        ...dbPlaylists.map((p: any) => ({
-          type: 'public_playlist',
-          id: p.id,
-          title: p.title,
-          thumbnail: JSON.parse(p.songs)[0]?.thumbnail || '',
-          uploaderName: p.username,
-          duration: `${JSON.parse(p.songs).length} songs`,
-          songs: JSON.parse(p.songs)
-        }))
+        ...searchResults.playlists.slice(0, 5).map((p: any) => ({ type: 'playlist', id: p.listId, title: p.title, thumbnail: p.thumbnail, uploaderName: p.author.name, duration: '' }))
       ];
       res.json({ items });
     } catch (err) {

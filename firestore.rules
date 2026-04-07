@@ -1,0 +1,76 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {userId}
+// Fields:
+//   - uid: string (required) - The user's unique ID
+//   - username: string (required) - The user's username
+//   - likedSongs: array (optional) - List of liked songs
+//   - playlists: array (optional) - List of user's private playlists
+//   - favoriteArtists: array (optional) - List of favorite artists
+//   - updatedAt: timestamp (optional) - Last update time
+//
+// Collection: public_playlists
+// Document ID: {playlistId}
+// Fields:
+//   - id: string (required) - Unique ID for the playlist
+//   - userId: string (required) - ID of the user who created it
+//   - username: string (required) - Username of the creator
+//   - title: string (required) - Playlist title
+//   - description: string (optional) - Playlist description
+//   - songs: array (required) - List of songs in the playlist
+//   - createdAt: timestamp (required) - Creation time
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAny(['likedSongs', 'playlists', 'favoriteArtists', 'updatedAt']);
+    }
+
+    function isValidPublicPlaylist(data) {
+      return data.keys().hasAll(['id', 'userId', 'username', 'title', 'songs', 'createdAt']) &&
+             data.id is string && data.id.size() > 0 &&
+             data.userId is string && data.userId == request.auth.uid &&
+             data.username is string && data.username.size() > 0 &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 100 &&
+             data.songs is list && data.songs.size() <= 500 &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read, write: if isOwner(userId) && (request.method == 'GET' || isValidUser(request.resource.data));
+    }
+
+    match /public_playlists/{playlistId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && isValidPublicPlaylist(request.resource.data);
+      allow update, delete: if isDocOwner() && isValidPublicPlaylist(request.resource.data);
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Private user data including liked songs and playlists.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "username": { "type": "string" },
+        "likedSongs": { "type": "array" },
+        "playlists": { "type": "array" },
+        "favoriteArtists": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "username"]
+    },
+    "PublicPlaylist": {
+      "title": "Public Playlist",
+      "description": "A playlist shared with the community.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "username": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "songs": { "type": "array" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "username", "title", "songs"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile and private data."
+    },
+    "/public_playlists/{playlistId}": {
+      "schema": "PublicPlaylist",
+      "description": "Publicly shared playlists."
+    }
+  }
+}
