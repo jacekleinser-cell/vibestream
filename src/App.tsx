@@ -364,6 +364,7 @@ export default function App() {
   const [importPreviewSongs, setImportPreviewSongs] = useState<{ originalQuery: string, song: Song | null }[]>([]);
   const [isImportPreviewMode, setIsImportPreviewMode] = useState(false);
   const [importPlaylistName, setImportPlaylistName] = useState('');
+  const [importArtistName, setImportArtistName] = useState('');
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null);
   const [replaceSearchQuery, setReplaceSearchQuery] = useState('');
   const [replaceSearchResults, setReplaceSearchResults] = useState<Song[]>([]);
@@ -926,7 +927,8 @@ export default function App() {
         setImportProgress({ current: i + 1, total: lines.length });
         
         try {
-          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
+          const artistParam = importArtistName.trim() ? `&artist=${encodeURIComponent(importArtistName.trim())}` : '';
+          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}${artistParam}`);
           const items = searchData.items || [];
           const bestMatch = items.find((item: any) => item.type === 'video');
           previewItems.push({ originalQuery: query, song: bestMatch || null });
@@ -1268,11 +1270,8 @@ export default function App() {
     
     if (playerRef.current && isPlayerReady) {
       try {
-        // Only load if it's not already the current video
-        const currentVideoId = playerRef.current.getVideoData?.()?.video_id;
-        if (currentVideoId !== song.id) {
-          playerRef.current.loadVideoById(song.id);
-        }
+        // Force load and play to ensure transition
+        playerRef.current.loadVideoById(song.id);
         playerRef.current.playVideo();
       } catch (e) {
         console.error("Direct play error:", e);
@@ -1316,10 +1315,6 @@ export default function App() {
       
       const nextS = currentPlaylist[newIndex];
       playSong(nextS, true);
-      // Ensure it starts playing
-      if (playerRef.current && isPlayerReady) {
-        playerRef.current.playVideo();
-      }
     }
   };
 
@@ -1346,10 +1341,6 @@ export default function App() {
     
     const prevS = currentPlaylist[newIndex];
     playSong(prevS, true);
-    // Ensure it starts playing
-    if (playerRef.current && isPlayerReady) {
-      playerRef.current.playVideo();
-    }
   };
 
   // Backup poller to ensure continuous playback even if ENDED event is missed
@@ -2207,6 +2198,29 @@ export default function App() {
                             Paste a list of songs (one per line) or upload a text/CSV file.
                           </p>
                           
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-bold uppercase tracking-widest text-white/40 ml-1">Artist Name (Optional)</label>
+                              <input 
+                                type="text"
+                                value={importArtistName}
+                                onChange={(e) => setImportArtistName(e.target.value)}
+                                placeholder="e.g. Drake"
+                                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#1DB954] transition-all"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <label className="text-[10px] font-bold uppercase tracking-widest text-white/40 ml-1">Playlist Name</label>
+                              <input 
+                                type="text"
+                                value={importPlaylistName}
+                                onChange={(e) => setImportPlaylistName(e.target.value)}
+                                placeholder="My New Playlist"
+                                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-[#1DB954] transition-all"
+                              />
+                            </div>
+                          </div>
+
                           <div className="flex flex-col gap-3">
                             <label className="flex items-center gap-3 p-4 bg-white/5 border border-white/10 rounded-xl cursor-pointer hover:bg-white/10 transition-all group">
                               <div className="w-10 h-10 bg-white/5 rounded-lg flex items-center justify-center group-hover:bg-[#1DB954]/20 group-hover:text-[#1DB954] transition-all">

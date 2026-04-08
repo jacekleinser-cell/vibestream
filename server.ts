@@ -317,12 +317,15 @@ async function startServer() {
   // API route to proxy the search request
   app.get("/api/search", async (req, res) => {
     const query = req.query.q as string;
+    const artist = req.query.artist as string;
+    
     if (!query) {
       return res.status(400).json({ error: "Query parameter 'q' is required" });
     }
     try {
-      console.log(`YouTube Search: Searching for "${query}"...`);
-      const searchResults = await ytSearch(query);
+      const searchQuery = artist ? `${artist} - ${query}` : query;
+      console.log(`YouTube Search: Searching for "${searchQuery}"...`);
+      const searchResults = await ytSearch(searchQuery);
       
       // Filter and sort videos
       const filteredVideos = searchResults.videos
@@ -331,6 +334,14 @@ async function startServer() {
           return v.duration.seconds >= 60;
         })
         .sort((a: any, b: any) => {
+          // If artist is provided, prioritize exact channel matches
+          if (artist) {
+            const aMatchesArtist = a.author.name.toLowerCase().includes(artist.toLowerCase());
+            const bMatchesArtist = b.author.name.toLowerCase().includes(artist.toLowerCase());
+            if (aMatchesArtist && !bMatchesArtist) return -1;
+            if (!aMatchesArtist && bMatchesArtist) return 1;
+          }
+
           // Prioritize official artist channels or "Topic" channels
           const aIsOfficial = a.author.name.toLowerCase().includes('topic') || a.author.name.toLowerCase().includes('official');
           const bIsOfficial = b.author.name.toLowerCase().includes('topic') || b.author.name.toLowerCase().includes('official');
