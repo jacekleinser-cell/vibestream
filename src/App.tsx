@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback, ChangeEvent, FormEvent } from 'react';
-import { GoogleGenAI } from "@google/genai";
 import { 
   Shuffle, Sun, Moon, X, Search, Play, Pause, SkipBack, SkipForward, 
   Menu, Heart, Plus, Music, ListMusic, Home, Library, MoreVertical,
@@ -79,7 +78,7 @@ const SongRow = ({
 }) => (
   <div 
     className={`group flex items-center gap-4 p-3 rounded-xl hover:bg-white/10 transition-all cursor-pointer border border-transparent hover:border-white/5 ${isQueue && index === currentIndex ? 'bg-white/10 border-white/10' : ''}`}
-    onClick={() => onShowDetails ? onShowDetails(song) : playSong(song, isQueue)}
+    onClick={() => playSong(song, isQueue)}
   >
     <div className="relative w-14 h-14 flex-shrink-0 shadow-lg">
       <img src={song.thumbnail} className="w-full h-full object-cover rounded-lg" referrerPolicy="no-referrer" />
@@ -168,8 +167,6 @@ export default function App() {
   const [transferDestination, setTransferDestination] = useState<'new' | 'existing' | 'liked'>('new');
   const [selectedExistingPlaylist, setSelectedExistingPlaylist] = useState('');
   const [selectedSongDetails, setSelectedSongDetails] = useState<Song | null>(null);
-  const [songDetailsData, setSongDetailsData] = useState<SongDetails | null>(null);
-  const [isDetailsLoading, setIsDetailsLoading] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [volume, setVolume] = useState(100);
@@ -189,6 +186,8 @@ export default function App() {
   const [importProgress, setImportProgress] = useState({ current: 0, total: 0 });
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
+  const localUpdateTimestamp = useRef<number>(0);
+  const [hasLoadedFromFirestore, setHasLoadedFromFirestore] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
   const [authForm, setAuthForm] = useState({ email: '', password: '' });
@@ -213,6 +212,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
+  // Consolidated User Data Listener
   useEffect(() => {
     if (!user) {
       setLikedSongs([]);
@@ -221,15 +221,46 @@ export default function App() {
       return;
     }
 
-    const unsubscribe = onSnapshot(doc(db, 'users', user.uid), (docSnap) => {
+    const userDocRef = doc(db, 'users', user.uid);
+    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+      // CRITICAL: If we have pending local writes, OR we just updated locally, DO NOT overwrite local state
+      const timeSinceLocalUpdate = Date.now() - localUpdateTimestamp.current;
+      if (docSnap.metadata.hasPendingWrites || timeSinceLocalUpdate < 3000) {
+        console.log("Firestore Sync: Skipping update to protect local changes", { 
+          hasPendingWrites: docSnap.metadata.hasPendingWrites, 
+          timeSinceLocalUpdate 
+        });
+        return;
+      }
+
       if (docSnap.exists()) {
         const data = docSnap.data();
-        if (data.likedSongs) setLikedSongs(data.likedSongs);
-        if (data.playlists) setPlaylists(data.playlists);
-        if (data.favoriteArtists) setFavoriteArtists(data.favoriteArtists);
+        
+        // Only update if the data is actually different to avoid unnecessary re-renders and potential race conditions
+        if (data.likedSongs && JSON.stringify(data.likedSongs) !== JSON.stringify(likedSongsRef.current)) {
+          setLikedSongs(data.likedSongs);
+        }
+        if (data.playlists && JSON.stringify(data.playlists) !== JSON.stringify(userPlaylistsRef.current)) {
+          setPlaylists(data.playlists);
+        }
+        if (data.favoriteArtists && JSON.stringify(data.favoriteArtists) !== JSON.stringify(favoriteArtistsRef.current)) {
+          setFavoriteArtists(data.favoriteArtists);
+        }
+      } else {
+        // Initialize user doc if it doesn't exist
+        setDoc(userDocRef, {
+          uid: user.uid,
+          username: user.displayName || user.email?.split('@')[0] || 'User',
+          likedSongs: [],
+          playlists: [],
+          favoriteArtists: [],
+          updatedAt: Timestamp.now()
+        }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
       }
-    }, (error) => {
-      handleFirestoreError(error, OperationType.GET, `users/${user.uid}`);
+      setHasLoadedFromFirestore(true);
+    }, (err) => {
+      handleFirestoreError(err, OperationType.GET, `users/${user.uid}`);
+      setHasLoadedFromFirestore(true);
     });
 
     return () => unsubscribe();
@@ -247,37 +278,17 @@ export default function App() {
     });
     return () => unsubscribe();
   }, []);
-
-  useEffect(() => {
-    if (!user) return;
-
-    const userDocRef = doc(db, 'users', user.uid);
-    const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data.likedSongs) setLikedSongs(data.likedSongs);
-        if (data.playlists) setPlaylists(data.playlists);
-        if (data.favoriteArtists) setFavoriteArtists(data.favoriteArtists);
-      } else {
-        // Initialize user doc if it doesn't exist
-        setDoc(userDocRef, {
-          uid: user.uid,
-          username: user.displayName || user.email?.split('@')[0] || 'User',
-          likedSongs: [],
-          playlists: [],
-          favoriteArtists: [],
-          updatedAt: Timestamp.now()
-        }).catch(err => handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`));
-      }
-    }, (err) => handleFirestoreError(err, OperationType.GET, `users/${user.uid}`));
-
-    return () => unsubscribe();
-  }, [user]);
-
   const syncUserData = useCallback(async () => {
-    if (!user) return;
+    if (!user || !hasLoadedFromFirestore) return;
+    
     try {
       const userDocRef = doc(db, 'users', user.uid);
+      
+      // Update local storage as a fallback
+      localStorage.setItem('likedSongs', JSON.stringify(likedSongs));
+      localStorage.setItem('userPlaylists', JSON.stringify(playlists));
+      localStorage.setItem('favoriteArtists', JSON.stringify(favoriteArtists));
+
       await setDoc(userDocRef, {
         likedSongs,
         playlists,
@@ -287,12 +298,12 @@ export default function App() {
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `users/${user.uid}`);
     }
-  }, [user, likedSongs, playlists, favoriteArtists]);
+  }, [user, hasLoadedFromFirestore, likedSongs, playlists, favoriteArtists]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
       syncUserData();
-    }, 2000); // Debounce sync
+    }, 500); // Much faster sync (500ms) to prevent race conditions with onSnapshot
     return () => clearTimeout(timer);
   }, [syncUserData]);
 
@@ -369,6 +380,8 @@ export default function App() {
   const currentIndexRef = useRef(currentIndex);
   const isPlayingRef = useRef(isPlaying);
   const likedSongsRef = useRef(likedSongs);
+  const userPlaylistsRef = useRef(playlists);
+  const favoriteArtistsRef = useRef(favoriteArtists);
   const discoverySongsRef = useRef(discoverySongs);
   const isRepeatRef = useRef(isRepeat);
   const isShuffleRef = useRef(isShuffle);
@@ -397,6 +410,14 @@ export default function App() {
   useEffect(() => {
     likedSongsRef.current = likedSongs;
   }, [likedSongs]);
+
+  useEffect(() => {
+    userPlaylistsRef.current = playlists;
+  }, [playlists]);
+
+  useEffect(() => {
+    favoriteArtistsRef.current = favoriteArtists;
+  }, [favoriteArtists]);
 
   useEffect(() => {
     discoverySongsRef.current = discoverySongs;
@@ -437,6 +458,11 @@ export default function App() {
       console.log("Player init skipped:", { exists: !!playerRef.current, yt: !!window.YT, ytPlayer: !!window.YT?.Player });
       return;
     }
+
+    if (!document.getElementById('player')) {
+      console.error("Player element #player not found in DOM");
+      return;
+    }
     
     console.log("Initializing YouTube Player...");
     try {
@@ -447,9 +473,7 @@ export default function App() {
           'rel': 0, 
           'controls': 0, 
           'showinfo': 0,
-          'origin': window.location.origin,
           'enablejsapi': 1,
-          'widget_referrer': window.location.origin,
           'mute': 0
         },
         events: { 
@@ -457,6 +481,12 @@ export default function App() {
             console.log("Player Ready Event");
             setIsPlayerReady(true);
             setPlayerStatus('Ready');
+            
+            // Ensure volume and mute state are synced
+            if (playerRef.current) {
+              playerRef.current.setVolume(volume);
+              if (isMuted) playerRef.current.mute(); else playerRef.current.unMute();
+            }
             
             const songToPlay = pendingSongRef.current || currentSongRef.current || playlistRef.current[currentIndexRef.current];
             if (songToPlay && isPlayingRef.current) {
@@ -492,14 +522,8 @@ export default function App() {
               playerRef.current.playVideo();
             }
             if(e.data === window.YT.PlayerState.PAUSED) {
-              // Only set isPlaying to false if it's a genuine pause, 
-              // not a brief state change during loading
-              const currentTime = playerRef.current.getCurrentTime();
-              const duration = playerRef.current.getDuration();
-              if (currentTime > 0 && currentTime < duration - 1) {
-                setIsPlaying(false);
-                stopProgressTimer();
-              }
+              setIsPlaying(false);
+              stopProgressTimer();
             }
           },
           'onError': (e: any) => {
@@ -566,12 +590,27 @@ export default function App() {
       }
       
       if (isPlaying) {
+        playerRef.current.setVolume(volume);
+        if (isMuted) playerRef.current.mute(); else playerRef.current.unMute();
         playerRef.current.playVideo();
       } else {
         playerRef.current.pauseVideo();
       }
     }
-  }, [isPlayerReady, currentIndex, isPlaying, playlist]);
+  }, [isPlayerReady, currentIndex, isPlaying, playlist, volume, isMuted]);
+
+  useEffect(() => {
+    if (isPlayerReady && playerRef.current) {
+      playerRef.current.setVolume(volume);
+    }
+  }, [volume, isPlayerReady]);
+
+  useEffect(() => {
+    if (isPlayerReady && playerRef.current) {
+      if (isMuted) playerRef.current.mute();
+      else playerRef.current.unMute();
+    }
+  }, [isMuted, isPlayerReady]);
 
   const startProgressTimer = () => {
     stopProgressTimer();
@@ -876,77 +915,27 @@ export default function App() {
     if (!textImportValue.trim()) return;
     
     setIsTransferring(true);
-    setImportProgress({ current: 0, total: 1 }); // Initial stage
+    const lines = textImportValue.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+    setImportProgress({ current: 0, total: lines.length });
     
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-
-      // Step 1: Use AI to parse and clean the list
-      const parsePrompt = `
-        You are an expert music librarian. I have a messy list of songs/tracks. 
-        Please parse this list and return a clean JSON array of objects, where each object has "artist" and "title" fields.
-        If a line doesn't look like a song, skip it.
-        Input:
-        ${textImportValue}
-        
-        Return ONLY the JSON array.
-      `;
-
-      const parseResponse = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: parsePrompt,
-        config: {
-          responseMimeType: "application/json"
-        }
-      });
-      
-      const parseText = parseResponse.text || "[]";
-      const jsonMatch = parseText.match(/\[[\s\S]*\]/);
-      
-      if (!jsonMatch) {
-        throw new Error("Could not parse the song list. Please check the format.");
-      }
-
-      const parsedSongs: { artist: string, title: string }[] = JSON.parse(jsonMatch[0]);
-      
-      if (parsedSongs.length === 0) {
-        throw new Error("No songs found in the input.");
-      }
-
-      setImportProgress({ current: 0, total: parsedSongs.length });
       const previewItems: { originalQuery: string, song: Song | null }[] = [];
       
-      // Step 2: Search for each song with optimized queries
-      for (let i = 0; i < parsedSongs.length; i++) {
-        const { artist, title } = parsedSongs[i];
-        const originalQuery = `${artist} - ${title}`;
-        // Optimized query for better matching
-        const optimizedQuery = `${artist} ${title} official audio`;
-        
-        setImportProgress({ current: i + 1, total: parsedSongs.length });
+      for (let i = 0; i < lines.length; i++) {
+        const query = lines[i];
+        setImportProgress({ current: i + 1, total: lines.length });
         
         try {
-          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(optimizedQuery)}`);
+          const searchData = await safeFetch(`/api/search?q=${encodeURIComponent(query)}`);
           const items = searchData.items || [];
+          const bestMatch = items.find((item: any) => item.type === 'video');
+          previewItems.push({ originalQuery: query, song: bestMatch || null });
           
-          // Find the best match: prefer official audio or high quality videos
-          let bestMatch = items.find((item: any) => 
-            item.type === 'video' && 
-            (item.title.toLowerCase().includes('official') || item.title.toLowerCase().includes('audio'))
-          );
-          
-          if (!bestMatch) {
-            bestMatch = items.find((item: any) => item.type === 'video');
-          }
-
-          previewItems.push({ originalQuery, song: bestMatch || null });
-          
-          // Small delay to avoid rate limits
-          if (i < parsedSongs.length - 1) {
+          if (i < lines.length - 1) {
             await new Promise(resolve => setTimeout(resolve, 300));
           }
         } catch (e) {
-          previewItems.push({ originalQuery, song: null });
+          previewItems.push({ originalQuery: query, song: null });
         }
       }
 
@@ -962,6 +951,19 @@ export default function App() {
     }
   };
 
+  const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const content = e.target?.result as string;
+      setTextImportValue(content);
+      showToast("File loaded! Click 'Import' to start.", 'success');
+    };
+    reader.readAsText(file);
+  };
+
   const finalizeImport = () => {
     const songsToImport = importPreviewSongs.map(item => item.song).filter((s): s is Song => s !== null);
     if (songsToImport.length === 0) {
@@ -969,6 +971,7 @@ export default function App() {
       return;
     }
     const name = importPlaylistName.trim() || `Imported Playlist ${new Date().toLocaleDateString()}`;
+    localUpdateTimestamp.current = Date.now();
     setPlaylists(prev => [...prev, { name, songs: songsToImport }]);
     showToast(`Successfully created playlist "${name}" with ${songsToImport.length} songs`, 'success');
     setIsImportPreviewMode(false);
@@ -1006,6 +1009,7 @@ export default function App() {
   };
 
   const deletePlaylist = (name: string) => {
+    localUpdateTimestamp.current = Date.now();
     setPlaylists(prev => {
       const next = prev.filter(p => p.name !== name);
       localStorage.setItem('userPlaylists', JSON.stringify(next));
@@ -1187,6 +1191,7 @@ export default function App() {
   };
   const createPlaylist = () => {
     if (newPlaylistName) {
+      localUpdateTimestamp.current = Date.now();
       setPlaylists(prev => [...prev, { name: newPlaylistName, songs: [] }]);
       setNewPlaylistName('');
       setIsCreatePlaylistOpen(false);
@@ -1194,10 +1199,21 @@ export default function App() {
   };
 
   const toggleLikeSong = (song: Song) => {
-    setLikedSongs(prev => prev.some(s => s.id === song.id) ? prev.filter(s => s.id !== song.id) : [...prev, song]);
+    localUpdateTimestamp.current = Date.now();
+    setLikedSongs(prev => {
+      const isLiked = prev.some(s => s.id === song.id);
+      if (isLiked) {
+        showToast(`Removed "${song.title}" from Liked Songs`, 'info');
+        return prev.filter(s => s.id !== song.id);
+      } else {
+        showToast(`Added "${song.title}" to Liked Songs`, 'success');
+        return [...prev, song];
+      }
+    });
   };
 
   const addToPlaylist = (song: Song, playlistName: string) => {
+    localUpdateTimestamp.current = Date.now();
     setPlaylists(prev => prev.map(pl => pl.name === playlistName ? { ...pl, songs: [...pl.songs, song] } : pl));
     setIsAddToPlaylistOpen(false);
     setSongToAddToPlaylist(null);
@@ -1226,21 +1242,37 @@ export default function App() {
     });
   };
 
-  const playSong = (song: Song, fromQueue: boolean = false) => {
+  const playSong = (song: Song, context?: Song[] | boolean) => {
     trackPlay(song);
     setCurrentSong(song);
     localStorage.setItem('currentSong', JSON.stringify(song));
     
-    if (fromQueue) {
+    if (Array.isArray(context)) {
+      setPlaylist(context);
+      const index = context.findIndex(s => s.id === song.id);
+      setCurrentIndex(index !== -1 ? index : 0);
+    } else {
       const index = playlist.findIndex(s => s.id === song.id);
-      if (index !== -1) setCurrentIndex(index);
+      if (index !== -1) {
+        setCurrentIndex(index);
+      } else {
+        // Add to current playlist after current song
+        const nextPlaylist = [...playlist];
+        nextPlaylist.splice(currentIndex + 1, 0, song);
+        setPlaylist(nextPlaylist);
+        setCurrentIndex(currentIndex + 1);
+      }
     }
     
     setIsPlaying(true);
     
     if (playerRef.current && isPlayerReady) {
       try {
-        playerRef.current.loadVideoById(song.id);
+        // Only load if it's not already the current video
+        const currentVideoId = playerRef.current.getVideoData?.()?.video_id;
+        if (currentVideoId !== song.id) {
+          playerRef.current.loadVideoById(song.id);
+        }
         playerRef.current.playVideo();
       } catch (e) {
         console.error("Direct play error:", e);
@@ -1284,6 +1316,10 @@ export default function App() {
       
       const nextS = currentPlaylist[newIndex];
       playSong(nextS, true);
+      // Ensure it starts playing
+      if (playerRef.current && isPlayerReady) {
+        playerRef.current.playVideo();
+      }
     }
   };
 
@@ -1310,27 +1346,11 @@ export default function App() {
     
     const prevS = currentPlaylist[newIndex];
     playSong(prevS, true);
+    // Ensure it starts playing
+    if (playerRef.current && isPlayerReady) {
+      playerRef.current.playVideo();
+    }
   };
-
-  useEffect(() => {
-    const syncInterval = setInterval(() => {
-      if (isPlayerReady && playerRef.current && isPlaying) {
-        try {
-          const state = playerRef.current.getPlayerState?.();
-          // If supposed to be playing but is Cued (5) or Unstarted (-1)
-          // We force play. This overcomes browser autoplay blocks after the first user interaction.
-          // We no longer force play on Paused (2) to allow the user to pause.
-          if (state === 5 || state === -1) {
-            console.log("Sync loop: Force playing (state: " + state + ")...");
-            playerRef.current.playVideo();
-          }
-        } catch (err) {
-          console.error("Sync loop error:", err);
-        }
-      }
-    }, 1000); // More aggressive sync (1s)
-    return () => clearInterval(syncInterval);
-  }, [isPlaying, isPlayerReady]);
 
   // Backup poller to ensure continuous playback even if ENDED event is missed
   useEffect(() => {
@@ -1348,18 +1368,6 @@ export default function App() {
     return () => clearInterval(checkEnded);
   }, [isPlayerReady, isPlaying]);
 
-  const handleFileUpload = (e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const content = event.target?.result as string;
-      setTextImportValue(content);
-      showToast('File uploaded successfully', 'success');
-    };
-    reader.readAsText(file);
-  };
 
   const publishPlaylist = async (pl: Playlist) => {
     if (!user) {
@@ -1390,58 +1398,20 @@ export default function App() {
     }
   };
 
-  const fetchSongDetails = async (song: Song) => {
-    setSelectedSongDetails(song);
-    setIsDetailsLoading(true);
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
-      
-      const prompt = `Today's date is April 5th, 2026. Provide a deep, detailed, and comprehensive history for the song "${song.title}" by "${song.uploaderName}". 
-      Include:
-      1. A full, rich history of the song, its meaning, its production, and its cultural impact. (At least 3-4 paragraphs).
-      2. 5-6 UPCOMING tour dates or show locations for this artist for 2026 and 2027. Use Google Search to find real, current information.
-      3. 5 similar songs by this or other artists that fans of this track would love.
-      Format the response as a JSON object with keys: "history", "shows" (array of strings), "similarSongs" (array of strings).`;
-
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          tools: [{ googleSearch: {} }]
-        }
-      });
-      
-      const text = response.text || "{}";
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      
-      if (jsonMatch) {
-        setSongDetailsData(JSON.parse(jsonMatch[0]));
-      } else {
-        throw new Error("Invalid Gemini response");
-      }
-    } catch (err) {
-      console.error("Gemini details error:", err);
-      setSongDetailsData({ 
-        history: "Details currently unavailable.",
-        shows: ["Tour dates not found."],
-        similarSongs: []
-      });
-    } finally {
-      setIsDetailsLoading(false);
-    }
-  };
 
   const togglePlay = () => {
-    if (!playerRef.current || !isPlayerReady) {
+    if (!playerRef.current || !isPlayerReady || typeof playerRef.current.getPlayerState !== 'function') {
       setPlayerStatus('Player not ready...');
+      // Try to re-init if it's really stuck
+      if (!playerRef.current) initPlayer();
       return;
     }
     const state = playerRef.current.getPlayerState();
-    if (state === 1) {
+    if (state === window.YT.PlayerState.PLAYING || state === window.YT.PlayerState.BUFFERING) {
       playerRef.current.pauseVideo();
       setIsPlaying(false);
     } else {
+      if (typeof playerRef.current.unMute === 'function') playerRef.current.unMute();
       playerRef.current.playVideo();
       setIsPlaying(true);
     }
@@ -1829,7 +1799,6 @@ export default function App() {
                             toggleLikeSong={toggleLikeSong}
                             setSongToAddToPlaylist={setSongToAddToPlaylist}
                             setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                            onShowDetails={fetchSongDetails}
                           />
                         ))
                       ) : (
@@ -2027,7 +1996,6 @@ export default function App() {
                       toggleLikeSong={toggleLikeSong}
                       setSongToAddToPlaylist={setSongToAddToPlaylist}
                       setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                      onShowDetails={fetchSongDetails}
                     />
                   ))}
                 </div>
@@ -2082,7 +2050,6 @@ export default function App() {
                       toggleLikeSong={toggleLikeSong}
                       setSongToAddToPlaylist={setSongToAddToPlaylist}
                       setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                      onShowDetails={fetchSongDetails}
                     />
                   ))}
                 </div>
@@ -2198,7 +2165,6 @@ export default function App() {
                       setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
                       removeFromPlaylist={removeFromPlaylist}
                       playlistName={selectedPlaylist.name}
-                      onShowDetails={fetchSongDetails}
                     />
                   ))}
                   {selectedPlaylist?.songs.length === 0 && (
@@ -2221,72 +2187,68 @@ export default function App() {
                 animate={{ opacity: 1 }}
                 className="space-y-8 max-w-4xl mx-auto"
               >
-                <div className="flex items-center gap-6">
-                  <div className="w-24 h-24 bg-gradient-to-br from-[#1DB954] to-[#191414] rounded-2xl shadow-2xl flex items-center justify-center">
-                    <RefreshCw size={40} className={`text-white ${isTransferring ? 'animate-spin' : ''}`} />
+                  <div className="flex items-center gap-6">
+                    <div className="w-24 h-24 bg-gradient-to-br from-[#1DB954] to-[#191414] rounded-2xl shadow-2xl flex items-center justify-center">
+                      <RefreshCw size={40} className={`text-white ${isTransferring ? 'animate-spin' : ''}`} />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold uppercase tracking-widest mb-1 text-white/40">Music Importer</h4>
+                      <h1 className="text-4xl font-black mb-2">Transfer Your Music</h1>
+                      <p className="text-white/60 text-sm">Paste a list of songs to find them on YouTube.</p>
+                    </div>
                   </div>
-                  <div>
-                    <h4 className="text-xs font-bold uppercase tracking-widest mb-1 text-white/40">AI-Powered Importer</h4>
-                    <h1 className="text-4xl font-black mb-2">Transfer Your Music</h1>
-                    <p className="text-white/60 text-sm">Our AI accurately parses your list and finds the perfect matches on YouTube.</p>
-                  </div>
-                </div>
 
-                {!isImportPreviewMode ? (
-                  <div className="space-y-6">
-                    <div className="bg-white/5 p-8 rounded-3xl border border-white/10 space-y-6">
-                      <div className="space-y-2">
-                        <h3 className="text-xl font-bold">Paste your list or upload a file</h3>
-                        <p className="text-xs text-white/40 leading-relaxed">
-                          Paste a list of songs (one per line) or upload a text/CSV file. We'll find the best matches on YouTube for you.
-                        </p>
-                      </div>
-
-                      <div className="flex flex-col gap-4">
-                        <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-white/10 rounded-2xl cursor-pointer hover:bg-white/5 transition-all">
-                          <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                            <Plus className="w-8 h-8 text-white/40 mb-2" />
-                            <p className="text-sm text-white/40">Click to upload text or CSV file</p>
-                          </div>
-                          <input type="file" className="hidden" accept=".txt,.csv" onChange={handleFileUpload} />
-                        </label>
-
-                        <div className="relative">
-                          <div className="absolute inset-0 flex items-center">
-                            <div className="w-full border-t border-white/5"></div>
-                          </div>
-                          <div className="relative flex justify-center text-xs uppercase">
-                            <span className="bg-[#121212] px-2 text-white/20">Or paste content</span>
+                  {!isImportPreviewMode ? (
+                    <div className="space-y-6">
+                      <div className="bg-white/5 p-8 rounded-3xl border border-white/10 space-y-6">
+                        <div className="space-y-4">
+                          <h3 className="text-xl font-bold">Import Songs</h3>
+                          <p className="text-xs text-white/40 leading-relaxed">
+                            Paste a list of songs (one per line) or upload a text/CSV file.
+                          </p>
+                          
+                          <div className="flex flex-col gap-3">
+                            <label className="flex items-center gap-3 p-4 bg-white/5 border border-white/10 rounded-xl cursor-pointer hover:bg-white/10 transition-all group">
+                              <div className="w-10 h-10 bg-white/5 rounded-lg flex items-center justify-center group-hover:bg-[#1DB954]/20 group-hover:text-[#1DB954] transition-all">
+                                <Plus size={20} />
+                              </div>
+                              <div className="flex-1">
+                                <p className="text-sm font-bold">Upload Text/CSV</p>
+                                <p className="text-[10px] text-white/40">Import from exported files</p>
+                              </div>
+                              <input type="file" className="hidden" accept=".txt,.csv" onChange={handleFileUpload} />
+                            </label>
                           </div>
                         </div>
 
-                        <textarea 
-                          value={textImportValue}
-                          onChange={(e) => setTextImportValue(e.target.value)}
-                          placeholder="Artist - Song Name&#10;Artist - Song Name&#10;..."
-                          className="w-full h-64 bg-black/40 border border-white/10 rounded-2xl p-6 text-sm focus:outline-none focus:border-[#1DB954] custom-scrollbar transition-all"
-                        />
-                      </div>
+                        <div className="space-y-4">
+                          <textarea 
+                            value={textImportValue}
+                            onChange={(e) => setTextImportValue(e.target.value)}
+                            placeholder="Artist - Song Name&#10;Artist - Song Name&#10;..."
+                            className="w-full h-64 bg-black/40 border border-white/10 rounded-2xl p-6 text-sm focus:outline-none focus:border-[#1DB954] custom-scrollbar transition-all"
+                          />
+                        </div>
 
-                      <button 
-                        onClick={startTextImportPreview}
-                        disabled={!textImportValue.trim() || isTransferring}
-                        className="w-full bg-[#1DB954] text-white py-4 rounded-xl font-bold hover:scale-[1.01] active:scale-[0.99] transition-all disabled:opacity-50 flex items-center justify-center gap-3"
-                      >
-                        {isTransferring ? (
-                          <>
-                            <RefreshCw className="animate-spin" size={20} />
-                            <span>Processing {importProgress.current} / {importProgress.total}</span>
-                          </>
-                        ) : (
-                          <>
-                            <Music size={20} />
-                            <span>AI Analyze & Import</span>
-                          </>
-                        )}
-                      </button>
+                        <button 
+                          onClick={startTextImportPreview}
+                          disabled={!textImportValue.trim() || isTransferring}
+                          className="w-full bg-[#1DB954] text-white py-4 rounded-xl font-bold hover:scale-[1.01] active:scale-[0.99] transition-all disabled:opacity-50 flex items-center justify-center gap-3"
+                        >
+                          {isTransferring ? (
+                            <>
+                              <RefreshCw className="animate-spin" size={20} />
+                              <span>Processing {importProgress.current} / {importProgress.total}</span>
+                            </>
+                          ) : (
+                            <>
+                              <Music size={20} />
+                              <span>Import Songs</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     </div>
-                  </div>
                 ) : (
                   <div className="space-y-6">
                     <div className="flex flex-col gap-6">
@@ -2522,7 +2484,6 @@ export default function App() {
                         toggleLikeSong={toggleLikeSong}
                         setSongToAddToPlaylist={setSongToAddToPlaylist}
                         setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                        onShowDetails={fetchSongDetails}
                       />
                     ))}
                   </div>
@@ -2545,7 +2506,6 @@ export default function App() {
                         toggleLikeSong={toggleLikeSong}
                         setSongToAddToPlaylist={setSongToAddToPlaylist}
                         setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                        onShowDetails={fetchSongDetails}
                       />
                     ))}
                   </div>
@@ -2643,7 +2603,6 @@ export default function App() {
                           toggleLikeSong={toggleLikeSong}
                           setSongToAddToPlaylist={setSongToAddToPlaylist}
                           setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                          onShowDetails={fetchSongDetails}
                         />
                       ))}
                     </div>
@@ -2687,7 +2646,6 @@ export default function App() {
                     toggleLikeSong={toggleLikeSong}
                     setSongToAddToPlaylist={setSongToAddToPlaylist}
                     setIsAddToPlaylistOpen={setIsAddToPlaylistOpen}
-                    onShowDetails={fetchSongDetails}
                   />
                 ))}
               </div>
@@ -2761,6 +2719,16 @@ export default function App() {
         </div>
 
         <div className="hidden md:flex items-center justify-end gap-4 w-1/3">
+          <button 
+            onClick={() => {
+              resetPlayer();
+              showToast("Resetting player engine...", "info");
+            }}
+            className="text-white/40 hover:text-white transition-colors"
+            title="Reset Player Engine"
+          >
+            <RefreshCw size={18} />
+          </button>
           <button onClick={toggleMute} className="text-white/40 hover:text-white transition-colors">
             {isMuted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
           </button>
@@ -2774,14 +2742,11 @@ export default function App() {
         </div>
       </footer>
 
-      {/* Player - Kept visible but small to prevent browser throttling and allow manual click if blocked */}
-      <div className={`fixed bottom-24 right-4 bg-black rounded-lg overflow-hidden shadow-2xl border border-white/10 z-[50] group transition-all hover:scale-105 ${isMobile ? 'w-1 h-1 opacity-0' : 'w-[160px] h-[90px]'}`}>
+      {/* Player - Kept visible to prevent browser throttling */}
+      <div 
+        className={`fixed bottom-24 right-4 bg-black rounded-lg overflow-hidden shadow-2xl border border-white/10 z-[50] transition-all hover:scale-105 ${isMobile ? 'w-[140px] h-[80px]' : 'w-[200px] h-[112px]'}`}
+      >
         <div id="player" className="w-full h-full"></div>
-        {!isMobile && (
-          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center pointer-events-none">
-            <p className="text-[10px] font-bold text-white uppercase tracking-tighter">YouTube Engine</p>
-          </div>
-        )}
       </div>
 
       {/* Modals */}
@@ -2958,61 +2923,13 @@ export default function App() {
               </div>
 
               <div className="p-8 space-y-8 max-h-[60vh] overflow-y-auto custom-scrollbar">
-                {isDetailsLoading ? (
-                  <div className="flex flex-col items-center justify-center py-12 gap-4">
-                    <RefreshCw className="animate-spin text-[#1DB954]" size={40} />
-                    <p className="text-white/40 animate-pulse">Fetching artist history and tour dates...</p>
+                <div className="flex flex-col items-center justify-center py-12 gap-4">
+                  <Music className="text-[#1DB954]" size={48} />
+                  <div className="text-center">
+                    <h3 className="text-xl font-bold">{selectedSongDetails.title}</h3>
+                    <p className="text-white/40">{selectedSongDetails.uploaderName}</p>
                   </div>
-                ) : songDetailsData ? (
-                  <>
-                    <section className="space-y-3">
-                      <h3 className="text-xs font-bold uppercase tracking-widest text-white/40">About the Artist</h3>
-                      <p className="text-sm text-white/80 leading-relaxed bg-white/5 p-4 rounded-xl border border-white/5 whitespace-pre-wrap">
-                        {songDetailsData.history}
-                      </p>
-                    </section>
-
-                    <section className="space-y-3">
-                      <h3 className="text-xs font-bold uppercase tracking-widest text-white/40">Upcoming Shows</h3>
-                      <div className="grid grid-cols-1 gap-2">
-                        {songDetailsData.shows.length > 0 ? songDetailsData.shows.map((show, i) => (
-                          <div key={i} className="flex items-center gap-3 p-3 bg-white/5 rounded-lg border border-white/5 hover:bg-white/10 transition-colors">
-                            <LayoutGrid size={16} className="text-[#1DB954]" />
-                            <span className="text-sm">{show}</span>
-                          </div>
-                        )) : (
-                          <p className="text-sm text-white/40 italic">No upcoming shows found.</p>
-                        )}
-                      </div>
-                    </section>
-
-                    <section className="space-y-3">
-                      <h3 className="text-xs font-bold uppercase tracking-widest text-white/40">Similar Songs</h3>
-                      <div className="grid grid-cols-1 gap-2">
-                        {songDetailsData.similarSongs.map((s, i) => (
-                          <button 
-                            key={i} 
-                            onClick={() => {
-                              setSearchQuery(s);
-                              setSelectedSongDetails(null);
-                              setIsSearchOpen(true);
-                              setViewingSection('home');
-                            }}
-                            className="flex items-center justify-between p-3 bg-white/5 rounded-lg border border-white/5 hover:border-[#1DB954]/50 transition-all text-left group"
-                          >
-                            <span className="text-sm group-hover:text-[#1DB954] transition-colors">{s}</span>
-                            <Search size={14} className="text-white/20 group-hover:text-[#1DB954]" />
-                          </button>
-                        ))}
-                      </div>
-                    </section>
-                  </>
-                ) : (
-                  <div className="text-center py-12">
-                    <AlertTriangle className="mx-auto mb-4 text-yellow-500" size={40} />
-                    <p className="text-white/60">Could not load details for this song.</p>
-                  </div>
-                )}
+                </div>
               </div>
 
               <div className="p-6 bg-white/5 border-t border-white/5 flex justify-end gap-3">

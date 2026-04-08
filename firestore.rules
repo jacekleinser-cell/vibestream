@@ -41,12 +41,25 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
 
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "nstrucks@gmail.com" && request.auth.token.email_verified == true));
+    }
+
     function isDocOwner() {
       return isAuthenticated() && request.auth.uid == resource.data.userId;
     }
 
     function isValidUser(data) {
-      return data.keys().hasAny(['likedSongs', 'playlists', 'favoriteArtists', 'updatedAt']);
+      return data.keys().hasAny(['likedSongs', 'playlists', 'favoriteArtists', 'updatedAt', 'uid', 'username', 'role']) &&
+             (!('uid' in data) || data.uid is string) &&
+             (!('username' in data) || (data.username is string && data.username.size() < 100)) &&
+             (!('likedSongs' in data) || data.likedSongs is list) &&
+             (!('playlists' in data) || data.playlists is list) &&
+             (!('favoriteArtists' in data) || data.favoriteArtists is list) &&
+             (!('updatedAt' in data) || data.updatedAt is timestamp) &&
+             (!('role' in data) || data.role in ['user', 'admin']);
     }
 
     function isValidPublicPlaylist(data) {
@@ -64,7 +77,14 @@ service cloud.firestore {
     // ===============================================================
 
     match /users/{userId} {
-      allow read, write: if isOwner(userId) && (request.method == 'GET' || isValidUser(request.resource.data));
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && 
+                      (!('role' in request.resource.data) || request.resource.data.role == 'user' || isAdmin());
+      allow update: if (isOwner(userId) && isValidUser(request.resource.data) && 
+                        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role || isAdmin())) || 
+                      isAdmin();
+      allow delete: if isAdmin();
     }
 
     match /public_playlists/{playlistId} {
